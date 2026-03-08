@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GLM-5 — 1層 FLOPS・通信量 (1GPUあたり)</title>
+  <title>GLM-5 — 1層 FLOPS・通信 (1GPUあたり)</title>
   <style>body{margin:0;}</style>
 </head>
 <body>
@@ -14,185 +14,205 @@
   <script type="text/babel">
 const { useState } = React;
 
-const D=6144,H=64,Q_R=2048,KV_R=512;
-const D_nope=192,D_rope=64,D_qk=256,D_v=256;
-const N_exp=256,K_exp=8,MoE_I=2048,Sh_I=12288;
+const D=6144,H=64,QR=2048,KR=512;
+const Dn=192,Dr=64,Dv=256;
+const NE=256,KE=8,MI=2048,SI=12288;
 const mm=(M,K,N)=>2*M*K*N;
 function fmt(n){if(n>=1e15)return(n/1e15).toFixed(2)+"P";if(n>=1e12)return(n/1e12).toFixed(2)+"T";if(n>=1e9)return(n/1e9).toFixed(2)+"G";if(n>=1e6)return(n/1e6).toFixed(2)+"M";if(n>=1e3)return(n/1e3).toFixed(2)+"K";return n.toFixed(0);}
 function fB(b){if(b>=1e9)return(b/1e9).toFixed(2)+" GB";if(b>=1e6)return(b/1e6).toFixed(2)+" MB";if(b>=1e3)return(b/1e3).toFixed(2)+" KB";if(b>0)return b.toFixed(0)+" B";return "0";}
 function pct(v,t){return t===0?"—":(v/t*100).toFixed(1)+"%";}
 
-// All values are PER-GPU
-function build(S, Skv, isDec, TP, EP){
+function build(S,Skv,isDec,TP,EP){
   const Sq=isDec?1:S, bpe=2;
-  const hpt=H/TP, ept=N_exp/EP;
-  const ops=[];
-  const arSend=(dataBytes,N)=>dataBytes*(N-1)/N;
+  const ht=H/TP, et=NE/EP;
+  const arS=(d,N)=>d*(N-1)/N;
+  const o=[];
+  const tpr=Sq*KE/EP;
 
-  ops.push({sec:"RMSNorm①",op:"正規化",
-    fGpu:5*Sq*D, fAll:5*Sq*D*TP,
-    par:"replicated",comm:"",cSend:0,cRecv:0,
-    note:"各GPUが全6144次元を保持・同一計算"});
+  o.push({s:"RMSNorm①",t:"E",
+    op:`正規化: (${Sq}×${D})`,
+    fg:5*Sq*D,fa:5*Sq*D*TP,
+    par:"replicated",comm:"",cs:0});
 
-  ops.push({sec:"Q射影",op:"Down: x×W_dq (→2048)",
-    fGpu:mm(Sq,D,Q_R), fAll:mm(Sq,D,Q_R)*TP,
-    par:"★replicated",comm:"",cSend:0,cRecv:0,
-    note:"各GPUが全W_dq(6144×2048)で同一計算。冗長だが通信回避。"});
+  o.push({s:"Q射影",t:"M",
+    op:`Down x×W_dq: (${Sq}×${D})×(${D}×${QR}) → (${Sq}×${QR})`,
+    fg:mm(Sq,D,QR),fa:mm(Sq,D,QR)*TP,
+    par:"★replicated",comm:"",cs:0});
 
-  ops.push({sec:"Q射影",op:`Up nope: c_q×W_uq (→${hpt}h×192)`,
-    fGpu:mm(Sq,Q_R,hpt*D_nope), fAll:mm(Sq,Q_R,H*D_nope),
-    par:`head分割 (÷${TP})`,comm:"",cSend:0,cRecv:0,
-    note:`各GPUが${hpt}heads分のW_uq_shard(2048×${hpt*D_nope})を保持`});
+  const uq=ht*Dn;
+  o.push({s:"Q射影",t:"M",
+    op:`Up nope c_q×W_uq: (${Sq}×${QR})×(${QR}×${uq}) → (${Sq}×${ht}h×${Dn})`,
+    fg:mm(Sq,QR,uq),fa:mm(Sq,QR,H*Dn),
+    par:`head÷${TP}`,comm:"",cs:0});
 
-  ops.push({sec:"Q射影",op:`Up rope: c_q×W_qr (→${hpt}h×64)`,
-    fGpu:mm(Sq,Q_R,hpt*D_rope), fAll:mm(Sq,Q_R,H*D_rope),
-    par:`head分割 (÷${TP})`,comm:"",cSend:0,cRecv:0,note:""});
+  const qr=ht*Dr;
+  o.push({s:"Q射影",t:"M",
+    op:`Up rope c_q×W_qr: (${Sq}×${QR})×(${QR}×${qr}) → (${Sq}×${ht}h×${Dr})`,
+    fg:mm(Sq,QR,qr),fa:mm(Sq,QR,H*Dr),
+    par:`head÷${TP}`,comm:"",cs:0});
 
-  ops.push({sec:"Q射影",op:"RoPE (Q)",
-    fGpu:6*Sq*hpt*(D_rope/2), fAll:6*Sq*H*(D_rope/2),
-    par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-
-  if(!isDec){
-    ops.push({sec:"KV射影",op:"Down: x×W_dkv (→512)",
-      fGpu:mm(S,D,KV_R), fAll:mm(S,D,KV_R)*TP,
-      par:"★replicated",comm:"",cSend:0,cRecv:0,
-      note:"KV_R=512と極小→冗長計算がAllGatherより安い"});
-    ops.push({sec:"KV射影",op:`Up K: c_kv×W_uk (→${hpt}h×192)`,
-      fGpu:mm(S,KV_R,hpt*D_nope), fAll:mm(S,KV_R,H*D_nope),
-      par:`head分割 (÷${TP})`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"KV射影",op:`Up V: c_kv×W_uv (→${hpt}h×256)`,
-      fGpu:mm(S,KV_R,hpt*D_v), fAll:mm(S,KV_R,H*D_v),
-      par:`head分割 (÷${TP})`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"KV射影",op:"K rope: x×W_kr (→64)",
-      fGpu:mm(S,D,D_rope), fAll:mm(S,D,D_rope)*TP,
-      par:"replicated",comm:"",cSend:0,cRecv:0,note:"全head共有"});
-    ops.push({sec:"KV射影",op:"RoPE (K)",
-      fGpu:6*S*(D_rope/2), fAll:6*S*(D_rope/2)*TP,
-      par:"replicated",comm:"",cSend:0,cRecv:0,note:""});
-  } else {
-    ops.push({sec:"KV射影(新tok)",op:"Down: x×W_dkv",
-      fGpu:mm(1,D,KV_R), fAll:mm(1,D,KV_R)*TP,
-      par:"replicated",comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"KV射影(新tok)",op:"K rope",
-      fGpu:mm(1,D,D_rope), fAll:mm(1,D,D_rope)*TP,
-      par:"replicated",comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"KV射影(新tok)",op:"RoPE (K)",
-      fGpu:6*(D_rope/2), fAll:6*(D_rope/2)*TP,
-      par:"replicated",comm:"",cSend:0,cRecv:0,note:""});
-  }
+  o.push({s:"Q射影",t:"E",
+    op:`RoPE回転: (${Sq}×${ht}h×${Dr/2}pairs)`,
+    fg:6*Sq*ht*(Dr/2),fa:6*Sq*H*(Dr/2),
+    par:`÷${TP}`,comm:"",cs:0});
 
   if(!isDec){
-    ops.push({sec:"Attention",op:`Q×K^T (${hpt}h)`,
-      fGpu:hpt*mm(S,D_qk,S), fAll:H*mm(S,D_qk,S),
-      par:`head分割 (÷${TP})`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"Attention",op:"Scale+Mask+Softmax",
-      fGpu:7*hpt*S*S, fAll:7*H*S*S,
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"Attention",op:`Weights×V (${hpt}h)`,
-      fGpu:hpt*mm(S,S,D_v), fAll:H*mm(S,S,D_v),
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
+    o.push({s:"KV射影",t:"M",
+      op:`Down x×W_dkv: (${S}×${D})×(${D}×${KR}) → c_kv(${S}×${KR}) [cache]`,
+      fg:mm(S,D,KR),fa:mm(S,D,KR)*TP,
+      par:"★replicated",comm:"",cs:0});
+
+    const uk=ht*Dn;
+    o.push({s:"KV射影",t:"M",
+      op:`Up K c_kv×W_uk: (${S}×${KR})×(${KR}×${uk}) → K_nope(${S}×${ht}h×${Dn})`,
+      fg:mm(S,KR,uk),fa:mm(S,KR,H*Dn),
+      par:`head÷${TP}`,comm:"",cs:0});
+
+    const uv=ht*Dv;
+    o.push({s:"KV射影",t:"M",
+      op:`Up V c_kv×W_uv: (${S}×${KR})×(${KR}×${uv}) → V(${S}×${ht}h×${Dv})`,
+      fg:mm(S,KR,uv),fa:mm(S,KR,H*Dv),
+      par:`head÷${TP}`,comm:"",cs:0});
+
+    o.push({s:"KV射影",t:"M",
+      op:`K rope x×W_kr: (${S}×${D})×(${D}×${Dr}) → K_rope(${S}×${Dr}) [cache]`,
+      fg:mm(S,D,Dr),fa:mm(S,D,Dr)*TP,
+      par:"replicated",comm:"",cs:0});
+
+    o.push({s:"KV射影",t:"E",
+      op:`RoPE回転 K: (${S}×${Dr/2}pairs)`,
+      fg:6*S*(Dr/2),fa:6*S*(Dr/2)*TP,
+      par:"replicated",comm:"",cs:0});
   } else {
-    ops.push({sec:"Absorbed Attn",op:"Q'=Q_nope×W_uk^T",
-      fGpu:hpt*mm(1,D_nope,KV_R), fAll:H*mm(1,D_nope,KV_R),
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"Absorbed Attn",op:"nope: Q'×c_kv^T",
-      fGpu:hpt*mm(1,KV_R,Skv), fAll:H*mm(1,KV_R,Skv),
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"Absorbed Attn",op:"rope: Q_rope×K_rope^T",
-      fGpu:hpt*mm(1,D_rope,Skv), fAll:H*mm(1,D_rope,Skv),
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"Absorbed Attn",op:"合成+Softmax",
-      fGpu:7*hpt*Skv, fAll:7*H*Skv,
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"V集約(Abs)",op:"weights×c_kv",
-      fGpu:hpt*mm(1,Skv,KV_R), fAll:H*mm(1,Skv,KV_R),
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-    ops.push({sec:"V集約(Abs)",op:"×W_uv",
-      fGpu:hpt*mm(1,KV_R,D_v), fAll:H*mm(1,KV_R,D_v),
-      par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
+    o.push({s:"KV射影(新tok)",t:"M",
+      op:`Down x×W_dkv: (1×${D})×(${D}×${KR}) → c_kv(1×${KR}) [cache追記]`,
+      fg:mm(1,D,KR),fa:mm(1,D,KR)*TP,
+      par:"replicated",comm:"",cs:0});
+    o.push({s:"KV射影(新tok)",t:"M",
+      op:`K rope x×W_kr: (1×${D})×(${D}×${Dr}) → K_rope(1×${Dr}) [cache追記]`,
+      fg:mm(1,D,Dr),fa:mm(1,D,Dr)*TP,
+      par:"replicated",comm:"",cs:0});
+    o.push({s:"KV射影(新tok)",t:"E",
+      op:`RoPE回転 K: (1×${Dr/2}pairs)`,
+      fg:6*(Dr/2),fa:6*(Dr/2)*TP,
+      par:"replicated",comm:"",cs:0});
   }
 
-  const arData = Sq*D*bpe;
-  const arPerGpu = arSend(arData, TP);
-  ops.push({sec:"Attn出力",op:"W_o → AllReduce #1",
-    fGpu:mm(Sq,hpt*D_v,D), fAll:mm(Sq,H*D_v,D),
-    par:`行分割(÷${TP}) → AllReduce`,
-    comm:`★ AR#1 (TP=${TP})`,cSend:arPerGpu,cRecv:arPerGpu,
-    note:`Ring AR: 各GPUがS×6144×2Bの(${TP}-1)/${TP}を送受信`});
+  const Dqk=Dn+Dr;
+  if(!isDec){
+    o.push({s:"Attention",t:"M",
+      op:`Q×K^T: ${ht}h × (${S}×${Dqk})×(${Dqk}×${S}) → scores(${S}×${S})`,
+      fg:ht*mm(S,Dqk,S),fa:H*mm(S,Dqk,S),
+      par:`head÷${TP}`,comm:"",cs:0});
+    o.push({s:"Attention",t:"E",
+      op:`Scale÷√${Dqk} + CausalMask + Softmax: (${ht}h×${S}×${S})`,
+      fg:7*ht*S*S,fa:7*H*S*S,
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"Attention",t:"M",
+      op:`Weights×V: ${ht}h × (${S}×${S})×(${S}×${Dv}) → out(${S}×${Dv})`,
+      fg:ht*mm(S,S,Dv),fa:H*mm(S,S,Dv),
+      par:`head÷${TP}`,comm:"",cs:0});
+  } else {
+    o.push({s:"Absorbed",t:"M",
+      op:`Q吸収 Q_nope×W_uk^T: ${ht}h × (1×${Dn})×(${Dn}×${KR}) → Q'(1×${KR})`,
+      fg:ht*mm(1,Dn,KR),fa:H*mm(1,Dn,KR),
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"Absorbed",t:"M",
+      op:`nope score Q'×c_kv^T: ${ht}h × (1×${KR})×(${KR}×${Skv}) → (1×${Skv})`,
+      fg:ht*mm(1,KR,Skv),fa:H*mm(1,KR,Skv),
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"Absorbed",t:"M",
+      op:`rope score Q_r×K_r^T: ${ht}h × (1×${Dr})×(${Dr}×${Skv}) → (1×${Skv})`,
+      fg:ht*mm(1,Dr,Skv),fa:H*mm(1,Dr,Skv),
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"Absorbed",t:"E",
+      op:`scores合成 + Softmax: (${ht}h×1×${Skv})`,
+      fg:7*ht*Skv,fa:7*H*Skv,
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"V集約",t:"M",
+      op:`w×c_kv: ${ht}h × (1×${Skv})×(${Skv}×${KR}) → agg(1×${KR})`,
+      fg:ht*mm(1,Skv,KR),fa:H*mm(1,Skv,KR),
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"V集約",t:"M",
+      op:`agg×W_uv: ${ht}h × (1×${KR})×(${KR}×${Dv}) → V_out(1×${Dv})`,
+      fg:ht*mm(1,KR,Dv),fa:H*mm(1,KR,Dv),
+      par:`÷${TP}`,comm:"",cs:0});
+  }
 
-  ops.push({sec:"残差①",op:"x + attn_out",
-    fGpu:Sq*D, fAll:Sq*D*TP,
-    par:"replicated (AR後)",comm:"",cSend:0,cRecv:0,note:""});
-  ops.push({sec:"RMSNorm②",op:"正規化",
-    fGpu:5*Sq*D, fAll:5*Sq*D*TP,
-    par:"replicated",comm:"",cSend:0,cRecv:0,note:""});
+  const oR=ht*Dv;
+  const arD=Sq*D*bpe;
+  o.push({s:"Attn出力",t:"M",
+    op:`W_o: (${Sq}×${oR})×(${oR}×${D}) → partial(${Sq}×${D}) → AllReduce`,
+    fg:mm(Sq,oR,D),fa:mm(Sq,H*Dv,D),
+    par:`行分割÷${TP}`,comm:`★AR#1(TP=${TP})`,cs:arS(arD,TP)});
 
-  ops.push({sec:"Router",op:"h×W_gate (→256)",
-    fGpu:mm(Sq,D,N_exp), fAll:mm(Sq,D,N_exp)*TP,
-    par:"★replicated",comm:"",cSend:0,cRecv:0,
-    note:"全GPUが全256 expertスコアを計算 (ルーティング結果を一致させる)"});
-  ops.push({sec:"Router",op:"sigmoid+topk+norm",
-    fGpu:10*Sq*N_exp, fAll:10*Sq*N_exp*TP,
-    par:"replicated",comm:"",cSend:0,cRecv:0,note:""});
+  o.push({s:"残差①",t:"E",
+    op:`加算: (${Sq}×${D}) + (${Sq}×${D})`,
+    fg:Sq*D,fa:Sq*D*TP,par:"replicated",comm:"",cs:0});
+  o.push({s:"RMSNorm②",t:"E",
+    op:`正規化: (${Sq}×${D})`,
+    fg:5*Sq*D,fa:5*Sq*D*TP,par:"replicated",comm:"",cs:0});
 
-  const a2aPerGpu = Sq * K_exp * ((EP-1)/EP) * D * bpe;
-  ops.push({sec:"EP Dispatch",op:`All-to-All #1 (EP=${EP})`,
-    fGpu:0, fAll:0,
-    par:`各GPUが自分のSqトークンのh_norm(6144d)を\n選択expertの所在ランクへ送信`,
-    comm:`★ A2A#1 (EP=${EP})`,cSend:a2aPerGpu,cRecv:a2aPerGpu,
-    note:`各GPU送信: ${Sq}tok×8exp×${((EP-1)/EP).toFixed(2)}×6144×2B\n各GPU受信: 他ランクから届くtoken (対称なら同量)`});
+  o.push({s:"Router",t:"M",
+    op:`h×W_gate: (${Sq}×${D})×(${D}×${NE}) → scores(${Sq}×${NE})`,
+    fg:mm(Sq,D,NE),fa:mm(Sq,D,NE)*TP,
+    par:"★replicated",comm:"",cs:0});
+  o.push({s:"Router",t:"E",
+    op:`sigmoid + topk8 + norm: (${Sq}×${NE})`,
+    fg:10*Sq*NE,fa:10*Sq*NE*TP,
+    par:"replicated",comm:"",cs:0});
 
-  const tokPerRank = Sq * K_exp / EP;
-  ops.push({sec:"Expert×8",op:"Gate+Up ×8 experts",
-    fGpu: (Sq*K_exp/EP)*mm(1,D,2*MoE_I),
-    fAll: K_exp*mm(Sq,D,2*MoE_I),
-    par:`EP分割: 各GPU ${ept}experts保持\n平均${tokPerRank.toFixed(0)}tok受信 (均等時)`,
-    comm:"",cSend:0,cRecv:0,note:""});
+  const a2a=Sq*KE*((EP-1)/EP)*D*bpe;
+  o.push({s:"EP Dispatch",t:"E",
+    op:`All-to-All: ${Sq}tok×8exp×${((EP-1)/EP).toFixed(2)}×${D}dim×${bpe}B`,
+    fg:0,fa:0,
+    par:`EP=${EP} (${et}exp/GPU)`,comm:`★A2A#1(EP=${EP})`,cs:a2a});
 
-  ops.push({sec:"Expert×8",op:"SiLU+gate⊙up",
-    fGpu: (Sq*K_exp/EP)*5*MoE_I,
-    fAll: K_exp*5*Sq*MoE_I,
-    par:"",comm:"",cSend:0,cRecv:0,note:""});
+  o.push({s:"Expert×8",t:"M",
+    op:`Gate+Up: ${tpr.toFixed(0)}tok × (1×${D})×(${D}×${2*MI}) → (1×${2*MI})`,
+    fg:tpr*mm(1,D,2*MI),fa:KE*mm(Sq,D,2*MI),
+    par:`EP÷${EP}: ${et}exp/GPU`,comm:"",cs:0});
+  o.push({s:"Expert×8",t:"E",
+    op:`SiLU(gate)⊙up: ${tpr.toFixed(0)}tok × (1×${MI})`,
+    fg:tpr*5*MI,fa:KE*5*Sq*MI,
+    par:"",comm:"",cs:0});
+  o.push({s:"Expert×8",t:"M",
+    op:`Down: ${tpr.toFixed(0)}tok × (1×${MI})×(${MI}×${D}) → (1×${D})`,
+    fg:tpr*mm(1,MI,D),fa:KE*mm(Sq,MI,D),
+    par:`EP÷${EP}`,comm:"",cs:0});
+  o.push({s:"Expert×8",t:"E",
+    op:`重み付き合成: ${(Sq/EP).toFixed(0)}tok × Σ(w×expert_out)`,
+    fg:KE*2*Sq*D/EP,fa:KE*2*Sq*D,
+    par:"",comm:"",cs:0});
 
-  ops.push({sec:"Expert×8",op:"Down ×8",
-    fGpu: (Sq*K_exp/EP)*mm(1,MoE_I,D),
-    fAll: K_exp*mm(Sq,MoE_I,D),
-    par:"EP分割",comm:"",cSend:0,cRecv:0,note:""});
+  o.push({s:"EP Combine",t:"E",
+    op:`All-to-All: Dispatchと対称`,
+    fg:0,fa:0,
+    par:"対称",comm:`★A2A#2(EP=${EP})`,cs:a2a});
 
-  ops.push({sec:"Expert×8",op:"重み付き合成",
-    fGpu: K_exp*2*Sq*D/EP,
-    fAll: K_exp*2*Sq*D,
-    par:"",comm:"",cSend:0,cRecv:0,note:""});
+  const si=2*SI/TP;
+  o.push({s:"共有Expert",t:"M",
+    op:`Gate+Up h×W: (${Sq}×${D})×(${D}×${si}) → (${Sq}×${si})`,
+    fg:mm(Sq,D,si),fa:mm(Sq,D,2*SI),
+    par:`列分割÷${TP}`,comm:"",cs:0});
+  o.push({s:"共有Expert",t:"E",
+    op:`SiLU(gate)⊙up: (${Sq}×${SI/TP})`,
+    fg:5*Sq*SI/TP,fa:5*Sq*SI,
+    par:`÷${TP}`,comm:"",cs:0});
+  const arD2=Sq*D*bpe;
+  o.push({s:"共有Expert",t:"M",
+    op:`Down h×W: (${Sq}×${SI/TP})×(${SI/TP}×${D}) → partial(${Sq}×${D}) → AR`,
+    fg:mm(Sq,SI/TP,D),fa:mm(Sq,SI,D),
+    par:`行分割÷${TP}`,comm:`★AR#2(TP=${TP})`,cs:arS(arD2,TP)});
 
-  ops.push({sec:"EP Combine",op:`All-to-All #2 (EP=${EP})`,
-    fGpu:0, fAll:0,
-    par:"expert出力を元のtokenオーナーへ返送",
-    comm:`★ A2A#2 (EP=${EP})`,cSend:a2aPerGpu,cRecv:a2aPerGpu,
-    note:"Dispatchと対称"});
+  o.push({s:"残差②",t:"E",
+    op:`加算: routed + shared + h (${Sq}×${D})`,
+    fg:2*Sq*D,fa:2*Sq*D*TP,par:"replicated",comm:"",cs:0});
 
-  ops.push({sec:"共有Expert",op:`Gate+Up (→${2*Sh_I/TP}/TP)`,
-    fGpu:mm(Sq,D,2*Sh_I/TP), fAll:mm(Sq,D,2*Sh_I),
-    par:`列分割(÷${TP})`,comm:"",cSend:0,cRecv:0,note:""});
-  ops.push({sec:"共有Expert",op:"SiLU+gate⊙up",
-    fGpu:5*Sq*Sh_I/TP, fAll:5*Sq*Sh_I,
-    par:`÷${TP}`,comm:"",cSend:0,cRecv:0,note:""});
-
-  const arData2 = Sq*D*bpe;
-  const arPerGpu2 = arSend(arData2, TP);
-  ops.push({sec:"共有Expert",op:"Down → AllReduce #2",
-    fGpu:mm(Sq,Sh_I/TP,D), fAll:mm(Sq,Sh_I,D),
-    par:`行分割(÷${TP}) → AllReduce`,
-    comm:`★ AR#2 (TP=${TP})`,cSend:arPerGpu2,cRecv:arPerGpu2,
-    note:""});
-
-  ops.push({sec:"残差②",op:"routed+shared+h",
-    fGpu:2*Sq*D, fAll:2*Sq*D*TP,
-    par:"replicated (AR後)",comm:"",cSend:0,cRecv:0,note:""});
-
-  return ops;
+  return o;
 }
 
-function grp(ops){const g=[];let c=null;for(const o of ops){if(!c||c.sec!==o.sec){c={sec:o.sec,ops:[]};g.push(c);}c.ops.push(o);}return g;}
+function grp(ops){const g=[];let c=null;for(const o of ops){if(!c||c.s!==o.s){c={s:o.s,ops:[]};g.push(c);}c.ops.push(o);}return g;}
 
 function App(){
   const [mode,setMode]=useState("prefill");
@@ -203,75 +223,74 @@ function App(){
   const isDec=mode==="decode";
   const ops=build(S,Skv,isDec,TP,EP);
   const groups=grp(ops);
-  const gpuF=ops.reduce((s,o)=>s+o.fGpu,0);
-  const allF=ops.reduce((s,o)=>s+o.fAll,0);
-  const gpuSend=ops.reduce((s,o)=>s+o.cSend,0);
-  const arSend_=ops.filter(o=>o.comm.includes("AR")).reduce((s,o)=>s+o.cSend,0);
-  const a2aSend=ops.filter(o=>o.comm.includes("A2A")).reduce((s,o)=>s+o.cSend,0);
-  const replF=ops.filter(o=>o.par.includes("replicated")||o.par.includes("★replicated")).reduce((s,o)=>s+o.fGpu,0);
-  const splitF=gpuF-replF;
+  const gpuF=ops.reduce((a,o)=>a+o.fg,0);
+  const allF=ops.reduce((a,o)=>a+o.fa,0);
+  const gpuSend=ops.reduce((a,o)=>a+o.cs,0);
+  const arS_=ops.filter(o=>o.comm.includes("AR")).reduce((a,o)=>a+o.cs,0);
+  const a2aS_=ops.filter(o=>o.comm.includes("A2A")).reduce((a,o)=>a+o.cs,0);
+  const replF=ops.filter(o=>o.par.includes("replicated")||o.par.includes("★replicated")).reduce((a,o)=>a+o.fg,0);
 
-  const secS=groups.map(g=>({n:g.sec,fg:g.ops.reduce((s,o)=>s+o.fGpu,0),cs:g.ops.reduce((s,o)=>s+o.cSend,0)}));
-  const mxF=Math.max(...secS.map(s=>s.fg),1);
-  const mxC=Math.max(...secS.map(s=>s.cs),1);
+  const secS=groups.map(g=>({n:g.s,fg:g.ops.reduce((a,o)=>a+o.fg,0),cs:g.ops.reduce((a,o)=>a+o.cs,0)}));
+  const mxF=Math.max(...secS.map(x=>x.fg),1);
+  const mxC=Math.max(...secS.map(x=>x.cs),1);
   const pc=isDec?"#E8734A":"#4A90D9";
 
   return(
-    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#08080e,#0e0e1c,#0a0a14)",color:"#e0e0ec",fontFamily:"'IBM Plex Sans','Noto Sans JP',system-ui,sans-serif",padding:"16px 10px"}}>
+    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#08080e,#0e0e1c,#0a0a14)",color:"#e0e0ec",fontFamily:"'IBM Plex Sans','Noto Sans JP',system-ui,sans-serif",padding:"14px 8px"}}>
       <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
       <div style={{maxWidth:1200,margin:"0 auto"}}>
-        <div style={{textAlign:"center",marginBottom:12}}>
-          <h1 style={{fontSize:19,fontWeight:700,color:"#f0f0f5",margin:0}}>GLM-5 — 1層 FLOPS・通信量 (★全て1GPUあたり★)</h1>
-          <p style={{fontSize:10,color:"#666",margin:"3px 0 0"}}>FLOPS=各GPUの実演算量 (分割+冗長) | 通信=各GPUの送信量</p>
+        <div style={{textAlign:"center",marginBottom:10}}>
+          <h1 style={{fontSize:18,fontWeight:700,color:"#f0f0f5",margin:0}}>GLM-5 — 1層 FLOPS・通信 (全て1GPUあたり)</h1>
+          <p style={{fontSize:10,color:"#666",margin:"3px 0 0"}}>演算名+行列サイズ | FLOPS/GPU=実演算量 | 送信/GPU=各GPUの送信量</p>
         </div>
 
         {/* Controls */}
-        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:7,marginBottom:12,flexWrap:"wrap"}}>
+        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:7,marginBottom:10,flexWrap:"wrap"}}>
           {[{k:"prefill",l:"プリフィル"},{k:"decode",l:"デコード"}].map(m=>(
-            <button key={m.k} onClick={()=>setMode(m.k)} style={{padding:"6px 14px",borderRadius:6,fontSize:11.5,fontWeight:700,cursor:"pointer",
+            <button key={m.k} onClick={()=>setMode(m.k)} style={{padding:"5px 13px",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",
               border:mode===m.k?`2px solid ${m.k==="prefill"?"#4A90D9":"#E8734A"}`:"2px solid rgba(255,255,255,0.08)",
               background:mode===m.k?`${m.k==="prefill"?"#4A90D9":"#E8734A"}18`:"transparent",
               color:mode===m.k?(m.k==="prefill"?"#6BB3FF":"#FFB088"):"#666"}}>{m.l}</button>
           ))}
-          {[{l:isDec?"S_kv":"S",v:isDec?Skv:S,s:isDec?setSkv:setS},{l:"TP",v:TP,s:setTP},{l:"EP",v:EP,s:setEP}].map((c,i)=>(
+          {[{l:isDec?"S_kv":"S",v:isDec?Skv:S,fn:isDec?setSkv:setS},{l:"TP",v:TP,fn:setTP},{l:"EP",v:EP,fn:setEP}].map((c,i)=>(
             <div key={i} style={{display:"flex",alignItems:"center",gap:3}}>
-              <label style={{fontSize:9.5,color:"#888"}}>{c.l}=</label>
-              <input type="number" value={c.v} onChange={e=>{c.s(Math.max(1,parseInt(e.target.value)||1));}}
-                style={{width:50,padding:"3px 5px",borderRadius:4,border:"1px solid rgba(255,255,255,0.12)",background:"rgba(255,255,255,0.05)",color:"#ddd",fontSize:11.5,fontFamily:"'IBM Plex Mono',monospace"}}/>
+              <label style={{fontSize:9,color:"#888"}}>{c.l}=</label>
+              <input type="number" value={c.v} onChange={e=>{c.fn(Math.max(1,parseInt(e.target.value)||1));}}
+                style={{width:50,padding:"3px 5px",borderRadius:4,border:"1px solid rgba(255,255,255,0.12)",background:"rgba(255,255,255,0.05)",color:"#ddd",fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}/>
             </div>
           ))}
         </div>
 
-        {/* Summary - ALL PER GPU */}
-        <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:6,marginBottom:10}}>
+        {/* Summary */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:5,marginBottom:9}}>
           {[
-            {l:"FLOPS/GPU/層",v:fmt(gpuF),s:`×78=${fmt(gpuF*78)}`,c:"#e0e0f0"},
-            {l:"うち冗長計算",v:fmt(replF),s:`${pct(replF,gpuF)} (通信回避)`,c:"#ffcc44"},
-            {l:"うち分割計算",v:fmt(splitF),s:pct(splitF,gpuF),c:"#66bbff"},
-            {l:"送信量/GPU/層",v:fB(gpuSend),s:`×78=${fB(gpuSend*78)}`,c:"#ffaa66"},
-            {l:"AR送信(TP)",v:fB(arSend_),s:`×2回/層`,c:"#66bbff"},
-            {l:"A2A送信(EP)",v:fB(a2aSend),s:`×2回/層`,c:"#cc66ff"},
+            {l:"FLOPS/GPU/層",v:fmt(gpuF),u:`×78=${fmt(gpuF*78)}`,c:"#e0e0f0"},
+            {l:"冗長(replicated)",v:fmt(replF),u:pct(replF,gpuF),c:"#ffcc44"},
+            {l:"分割計算",v:fmt(gpuF-replF),u:pct(gpuF-replF,gpuF),c:"#66bbff"},
+            {l:"送信/GPU/層",v:fB(gpuSend),u:`×78=${fB(gpuSend*78)}`,c:"#ffaa66"},
+            {l:"AR送信(TP)",v:fB(arS_),u:"×2回/層",c:"#66bbff"},
+            {l:"A2A送信(EP)",v:fB(a2aS_),u:"×2回/層",c:"#cc66ff"},
           ].map((c,i)=>(
-            <div key={i} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:7,padding:"7px 8px",textAlign:"center"}}>
-              <div style={{fontSize:8,color:"#666",textTransform:"uppercase",letterSpacing:0.8}}>{c.l}</div>
-              <div style={{fontSize:13,fontWeight:700,color:c.c,fontFamily:"'IBM Plex Mono',monospace",margin:"1px 0"}}>{c.v}</div>
-              <div style={{fontSize:9,color:"#555"}}>{c.s}</div>
+            <div key={i} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:6,padding:"6px 7px",textAlign:"center"}}>
+              <div style={{fontSize:7.5,color:"#666",textTransform:"uppercase",letterSpacing:0.7}}>{c.l}</div>
+              <div style={{fontSize:12,fontWeight:700,color:c.c,fontFamily:"'IBM Plex Mono',monospace",margin:"1px 0"}}>{c.v}</div>
+              <div style={{fontSize:8.5,color:"#555"}}>{c.u}</div>
             </div>
           ))}
         </div>
 
-        {/* Dual bars */}
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
-          {[{ti:"FLOPS/GPU",k:"fg",mx:mxF,u:fmt,co:pc},{ti:"送信量/GPU",k:"cs",mx:mxC,u:fB,co:"#cc66ff"}].map((ch,ci)=>(
-            <div key={ci} style={{padding:"8px 10px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:8}}>
-              <div style={{fontSize:9,fontWeight:600,color:"#777",marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>{ch.ti}</div>
-              {secS.map((s,i)=>{const v=s[ch.k];return(
-                <div key={i} style={{display:"flex",alignItems:"center",marginBottom:2.5}}>
-                  <div style={{width:110,fontSize:9.5,color:"#999",flexShrink:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{s.n}</div>
-                  <div style={{flex:1,height:11,background:"rgba(255,255,255,0.03)",borderRadius:2,overflow:"hidden",marginRight:3}}>
+        {/* Bars */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:9}}>
+          {[{ti:"FLOPS/GPU",k:"fg",mx:mxF,u:fmt,co:pc},{ti:"送信/GPU",k:"cs",mx:mxC,u:fB,co:"#cc66ff"}].map((ch,ci)=>(
+            <div key={ci} style={{padding:"7px 9px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:7}}>
+              <div style={{fontSize:8.5,fontWeight:600,color:"#777",marginBottom:4,textTransform:"uppercase",letterSpacing:0.8}}>{ch.ti}</div>
+              {secS.map((x,i)=>{const v=x[ch.k];return(
+                <div key={i} style={{display:"flex",alignItems:"center",marginBottom:2}}>
+                  <div style={{width:100,fontSize:9,color:"#999",flexShrink:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{x.n}</div>
+                  <div style={{flex:1,height:10,background:"rgba(255,255,255,0.03)",borderRadius:2,overflow:"hidden",marginRight:3}}>
                     <div style={{height:"100%",width:`${ch.mx>0?Math.max(v>0?0.4:0,v/ch.mx*100):0}%`,background:`linear-gradient(90deg,${ch.co},${ch.co}88)`,borderRadius:2}}/>
                   </div>
-                  <div style={{width:60,fontSize:9.5,color:"#aaa",fontFamily:"'IBM Plex Mono',monospace",textAlign:"right"}}>{v>0?ch.u(v):"—"}</div>
+                  <div style={{width:55,fontSize:9,color:"#aaa",fontFamily:"'IBM Plex Mono',monospace",textAlign:"right"}}>{v>0?ch.u(v):"—"}</div>
                 </div>
               );})}
             </div>
@@ -279,98 +298,59 @@ function App(){
         </div>
 
         {/* Table */}
-        <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:8,overflow:"auto"}}>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:10.5,minWidth:1000}}>
+        <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:7,overflow:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:10,minWidth:1000}}>
             <thead>
               <tr style={{background:"rgba(255,255,255,0.04)"}}>
-                {["セクション","演算","型",{t:"FLOPS/GPU",w:85},{t:"FLOPS/全GPU",w:85},"分割方式",{t:"通信",w:90},{t:"送信/GPU",w:75}].map((h,i)=>{
-                  const txt=typeof h==="string"?h:h.t;
-                  return <th key={i} style={{padding:"6px 4px",textAlign:[3,4,7].includes(i)?"right":"left",color:"#777",fontWeight:600,fontSize:8.5,textTransform:"uppercase",letterSpacing:0.7,borderBottom:"1px solid rgba(255,255,255,0.06)",whiteSpace:"nowrap",width:typeof h==="object"?h.w:undefined}}>{txt}</th>;
-                })}
+                {["セクション","演算 (名前 + 行列サイズ)","型","FLOPS/GPU","FLOPS/全GPU","分割","通信","送信/GPU"].map((h,i)=>(
+                  <th key={i} style={{padding:"5px 3px",textAlign:[3,4,7].includes(i)?"right":"left",color:"#777",fontWeight:600,fontSize:8,textTransform:"uppercase",letterSpacing:0.6,borderBottom:"1px solid rgba(255,255,255,0.06)",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {groups.map((g,gi)=>{
-                const sgf=g.ops.reduce((s,o)=>s+o.fGpu,0);
-                const saf=g.ops.reduce((s,o)=>s+o.fAll,0);
-                const sc=g.ops.reduce((s,o)=>s+o.cSend,0);
+                const sgf=g.ops.reduce((a,x)=>a+x.fg,0);
+                const sc=g.ops.reduce((a,x)=>a+x.cs,0);
                 return g.ops.map((op,oi)=>(
                   <tr key={`${gi}-${oi}`} style={{borderBottom:"1px solid rgba(255,255,255,0.02)",background:oi===0?"rgba(255,255,255,0.008)":"transparent"}}>
-                    {oi===0&&<td rowSpan={g.ops.length} style={{padding:"4px",verticalAlign:"top",color:"#aaa",fontWeight:600,fontSize:9.5,borderRight:"1px solid rgba(255,255,255,0.03)",background:"rgba(255,255,255,0.005)",width:90}}>
-                      {g.sec}
+                    {oi===0&&<td rowSpan={g.ops.length} style={{padding:"3px",verticalAlign:"top",color:"#aaa",fontWeight:600,fontSize:9,borderRight:"1px solid rgba(255,255,255,0.03)",background:"rgba(255,255,255,0.005)",width:85}}>
+                      {g.s}
                       <div style={{fontSize:8,color:"#555",marginTop:1,fontFamily:"'IBM Plex Mono',monospace"}}>
-                        {sgf>0&&<div>GPU: {fmt(sgf)}</div>}
-                        {sc>0&&<div style={{color:"#cc66ff"}}>送: {fB(sc)}</div>}
+                        {sgf>0&&<div>{fmt(sgf)}</div>}
+                        {sc>0&&<div style={{color:"#cc66ff"}}>{fB(sc)}</div>}
                       </div>
                     </td>}
-                    <td style={{padding:"3px 4px",color:"#c0c0d0",fontSize:10}}>{op.op}</td>
+                    <td style={{padding:"3px 4px",color:"#d0d0e0",fontSize:10,fontFamily:"'IBM Plex Mono','Noto Sans JP',monospace",whiteSpace:"pre-wrap",lineHeight:1.35,maxWidth:380}}>{op.op}</td>
                     <td style={{padding:"3px 2px"}}>
-                      <span style={{display:"inline-block",padding:"0px 3px",borderRadius:2,fontSize:8.5,fontWeight:600,
-                        background:op.t==="M"?"rgba(74,144,217,0.12)":"rgba(255,180,80,0.08)",
+                      <span style={{display:"inline-block",padding:"0px 3px",borderRadius:2,fontSize:8.5,fontWeight:700,
+                        background:op.t==="M"?"rgba(74,144,217,0.15)":"rgba(255,180,80,0.1)",
                         color:op.t==="M"?"#6BB3FF":"#FFBB66"}}>{op.t==="M"?"MM":"El"}</span>
                     </td>
-                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#e0e0f0",fontWeight:600,fontSize:10,whiteSpace:"nowrap"}}>
-                      {op.fGpu>0?fmt(op.fGpu):"—"}
-                    </td>
-                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#888",fontSize:9.5,whiteSpace:"nowrap"}}>
-                      {op.fAll>0?fmt(op.fAll):"—"}
-                    </td>
-                    <td style={{padding:"3px 4px",fontSize:9,color:op.par.includes("★")?"#ffcc44":"#999",fontWeight:op.par.includes("★")?600:400,whiteSpace:"pre-wrap",lineHeight:1.35,maxWidth:200}}>
-                      {op.par||"—"}
-                    </td>
+                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#e0e0f0",fontWeight:600,fontSize:10,whiteSpace:"nowrap"}}>{op.fg>0?fmt(op.fg):"—"}</td>
+                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#777",fontSize:9,whiteSpace:"nowrap"}}>{op.fa>0?fmt(op.fa):"—"}</td>
+                    <td style={{padding:"3px 4px",fontSize:9,color:op.par.includes("★")?"#ffcc44":"#999",fontWeight:op.par.includes("★")?600:400,whiteSpace:"nowrap"}}>{op.par||"—"}</td>
                     <td style={{padding:"3px 4px",fontSize:9,whiteSpace:"nowrap",
                       color:op.comm.includes("AR")?"#66bbff":op.comm.includes("A2A")?"#cc66ff":"#555",
-                      fontWeight:op.cSend>0?600:400}}>{op.comm||"—"}</td>
-                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,
-                      color:op.cSend>0?"#ffaa66":"#444",fontWeight:op.cSend>0?600:400,whiteSpace:"nowrap"}}>
-                      {op.cSend>0?fB(op.cSend):"—"}
-                    </td>
+                      fontWeight:op.cs>0?600:400}}>{op.comm||"—"}</td>
+                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontSize:9,
+                      color:op.cs>0?"#ffaa66":"#444",fontWeight:op.cs>0?600:400,whiteSpace:"nowrap"}}>{op.cs>0?fB(op.cs):"—"}</td>
                   </tr>
                 ));
               })}
               <tr style={{background:"rgba(255,255,255,0.05)",borderTop:"2px solid rgba(255,255,255,0.1)"}}>
-                <td colSpan={3} style={{padding:"6px 4px",fontWeight:700,color:"#f0f0f5",fontSize:11}}>合計/層</td>
-                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#f0f0f5",fontSize:11}}>{fmt(gpuF)}</td>
-                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#888",fontSize:10}}>{fmt(allF)}</td>
-                <td/>
-                <td style={{padding:"6px 4px",fontWeight:600,color:"#ddd",fontSize:9}}>送信計/GPU</td>
-                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#ffaa66",fontSize:11}}>{fB(gpuSend)}</td>
+                <td colSpan={3} style={{padding:"5px 3px",fontWeight:700,color:"#f0f0f5",fontSize:10.5}}>合計/層</td>
+                <td style={{padding:"5px 3px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#f0f0f5",fontSize:10.5}}>{fmt(gpuF)}</td>
+                <td style={{padding:"5px 3px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#777",fontSize:9.5}}>{fmt(allF)}</td>
+                <td/><td style={{fontSize:9,color:"#ddd"}}>送信計</td>
+                <td style={{padding:"5px 3px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#ffaa66",fontSize:10.5}}>{fB(gpuSend)}</td>
               </tr>
             </tbody>
           </table>
         </div>
 
-        {/* Legend */}
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:10}}>
-          <div style={{padding:"9px 11px",background:"rgba(255,200,50,0.05)",border:"1px solid rgba(255,200,50,0.15)",borderRadius:7,fontSize:10,color:"#c8c8d8",lineHeight:1.6}}>
-            <strong style={{color:"#ffcc44"}}>★replicated = 冗長計算</strong><br/>
-            全GPUが同一計算を実行。FLOPS/GPU = FLOPS/全GPU。<br/>
-            通信が発生しない代わりにGPU間で計算が重複。<br/><br/>
-            対象: W_dq, W_dkv, W_kr, W_gate, RMSNorm<br/>
-            →ボトルネック次元が小さい射影＋全GPU同一結果が必要な処理
-          </div>
-          <div style={{padding:"9px 11px",background:"rgba(74,144,217,0.05)",border:"1px solid rgba(74,144,217,0.15)",borderRadius:7,fontSize:10,color:"#c8c8d8",lineHeight:1.6}}>
-            <strong style={{color:"#6BB3FF"}}>head/列/行 分割 + AllReduce</strong><br/>
-            FLOPS/GPU = FLOPS/全GPU ÷ TP。<br/>
-            W_oと共有Expert W_downで部分和→AllReduceが必要。<br/><br/>
-            AllReduce送信/GPU: S×6144×2B×(TP-1)/TP<br/>
-            Ring方式: 各GPUが≈data量を送信+受信<br/>
-            NVLink (~900GB/s)なら μs〜ms オーダー
-          </div>
-          <div style={{padding:"9px 11px",background:"rgba(204,102,255,0.05)",border:"1px solid rgba(204,102,255,0.15)",borderRadius:7,fontSize:10,color:"#c8c8d8",lineHeight:1.6}}>
-            <strong style={{color:"#cc66ff"}}>EP分割 + All-to-All</strong><br/>
-            FLOPS/GPU = FLOPS/全GPU ÷ EP (均等時)。<br/>
-            各GPUが{Math.ceil(256/EP)} experts保持。<br/><br/>
-            A2A送信/GPU: S×8×{((EP-1)/EP).toFixed(2)}×6144×2B<br/>
-            各GPUが他ランクのexpert宛tokenを送信。<br/>
-            マルチノード時はIB帯域(~400Gb/s)が律速。
-          </div>
-        </div>
-
-        <div style={{marginTop:8,padding:"7px 10px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",borderRadius:6,fontSize:9.5,color:"#666",lineHeight:1.55}}>
-          <strong style={{color:"#888"}}>全値は1GPUあたり。</strong>
-          「FLOPS/全GPU」列は参考値(モデル理論値)。Expert FLOPSはtoken均等分配を仮定(実際は偏りあり)。
-          FP8推論なら通信量半減。BF16前提。TP,EP,Sは上部で変更可能。
+        <div style={{marginTop:7,padding:"6px 9px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",borderRadius:5,fontSize:9,color:"#666",lineHeight:1.5}}>
+          <span style={{color:"#6BB3FF"}}>MM</span>=行列積(2MKN) <span style={{color:"#FFBB66"}}>El</span>=要素演算 <span style={{color:"#ffcc44"}}>★replicated</span>=冗長計算 <span style={{color:"#66bbff"}}>AR</span>=AllReduce <span style={{color:"#cc66ff"}}>A2A</span>=All-to-All |
+          行列サイズはTP/EP分割後の1GPU分。Expert FLOPSはtoken均等分配仮定。BF16前提。
         </div>
       </div>
     </div>
