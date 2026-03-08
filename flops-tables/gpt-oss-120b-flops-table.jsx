@@ -1,0 +1,372 @@
+import { useState } from "react";
+
+// === gpt-oss-120b constants (from config.json) ===
+const D=2880;          // hidden_size
+const H=64;            // num_attention_heads
+const KVH=8;           // num_key_value_heads (GQA group=8)
+const Hd=64;           // head_dim (D/H = 2880/64 = 45? no, head_dim=64 from config)
+                       // Note: H*Hd = 64*64 = 4096 ≠ 2880, so Q projection goes 2880→4096
+const NE=128;          // num_local_experts
+const KE=4;            // experts_per_token (top-4)
+const MI=2880;         // intermediate_size (per expert, SwiGLU)
+const NL=36;           // num_hidden_layers
+const SW=128;          // sliding_window
+const Vocab=201088;
+const QDim=H*Hd;       // 64*64=4096 (Q projection output)
+const KVDim=KVH*Hd;    // 8*64=512 (KV projection output)
+
+const mm=(M,K,N)=>2*M*K*N;
+function fmt(n){if(n>=1e15)return(n/1e15).toFixed(2)+"P";if(n>=1e12)return(n/1e12).toFixed(2)+"T";if(n>=1e9)return(n/1e9).toFixed(2)+"G";if(n>=1e6)return(n/1e6).toFixed(2)+"M";if(n>=1e3)return(n/1e3).toFixed(2)+"K";return n.toFixed(0);}
+function fB(b){if(b>=1e9)return(b/1e9).toFixed(2)+" GB";if(b>=1e6)return(b/1e6).toFixed(2)+" MB";if(b>=1e3)return(b/1e3).toFixed(2)+" KB";if(b>0)return b.toFixed(0)+" B";return "0";}
+function pct(v,t){return t===0?"—":(v/t*100).toFixed(1)+"%";}
+
+function build(S,Skv,isDec,TP,EP){
+  const Sq=isDec?1:S, bpe=2;
+  const ht=H/TP;         // attention heads per TP
+  const kvht=KVH/TP;     // KV heads per TP (GQA)
+  const et=NE/EP;         // experts per EP rank
+  const arS=(d,N)=>d*(N-1)/N;
+  const o=[];
+  const tpr=Sq*KE/EP;
+
+  // gpt-oss uses alternating sliding_attention (window=128) and full_attention
+  // For FLOPS we compute full attention; sliding halves the S_kv to min(S_kv, SW)
+  // We'll note this but compute as full for simplicity (user can set S accordingly)
+
+  // ===== RMSNorm 1 =====
+  o.push({s:"RMSNorm①",t:"E",
+    op:`正規化: (${Sq}×${D})`,
+    fg:5*Sq*D,fa:5*Sq*D*TP,
+    par:"replicated",comm:"",cs:0});
+
+  // ===== Q/K/V Projection (standard GQA, no MLA) =====
+  // Q: (Sq×D) × (D×QDim) → (Sq×QDim), then reshape to (Sq×H×Hd)
+  // K: (Sq×D) × (D×KVDim) → (Sq×KVDim), then reshape to (Sq×KVH×Hd)
+  // V: same as K
+  // With TP: Q split by heads, K/V split by KV heads
+
+  const qOut=ht*Hd;       // Q columns per TP rank
+  const kvOut=kvht*Hd;     // KV columns per TP rank
+
+  o.push({s:"QKV射影",t:"M",
+    op:`Q: x×W_q: (${Sq}×${D})×(${D}×${qOut}) → (${Sq}×${ht}h×${Hd})`,
+    fg:mm(Sq,D,qOut),fa:mm(Sq,D,QDim),
+    par:`head÷${TP}`,comm:"",cs:0});
+
+  o.push({s:"QKV射影",t:"M",
+    op:`K: x×W_k: (${Sq}×${D})×(${D}×${kvOut}) → (${Sq}×${kvht}kv×${Hd})`,
+    fg:mm(Sq,D,kvOut),fa:mm(Sq,D,KVDim),
+    par:`KVhead÷${TP}`,comm:"",cs:0});
+
+  o.push({s:"QKV射影",t:"M",
+    op:`V: x×W_v: (${Sq}×${D})×(${D}×${kvOut}) → (${Sq}×${kvht}kv×${Hd})`,
+    fg:mm(Sq,D,kvOut),fa:mm(Sq,D,KVDim),
+    par:`KVhead÷${TP}`,comm:"",cs:0});
+
+  // RoPE (applied to Q and K)
+  o.push({s:"QKV射影",t:"E",
+    op:`RoPE Q: (${Sq}×${ht}h×${Hd/2}pairs)`,
+    fg:6*Sq*ht*(Hd/2),fa:6*Sq*H*(Hd/2),
+    par:`÷${TP}`,comm:"",cs:0});
+
+  if(!isDec){
+    o.push({s:"QKV射影",t:"E",
+      op:`RoPE K: (${S}×${kvht}kv×${Hd/2}pairs)`,
+      fg:6*S*kvht*(Hd/2),fa:6*S*KVH*(Hd/2),
+      par:`÷${TP}`,comm:"",cs:0});
+  } else {
+    o.push({s:"QKV射影",t:"E",
+      op:`RoPE K: (1×${kvht}kv×${Hd/2}pairs)`,
+      fg:6*1*kvht*(Hd/2),fa:6*1*KVH*(Hd/2),
+      par:`÷${TP}`,comm:"",cs:0});
+  }
+
+  // ===== KV Cache note =====
+  // GQA: cache stores K and V for KVH heads
+  // Per token per layer: KVH * Hd * 2(K+V) * bpe = 8*64*2*2 = 2048 bytes
+  // With TP: each GPU caches kvht heads
+
+  // ===== Attention =====
+  const Skv_=isDec?Skv:S;
+  // GQA: each Q head group (H/KVH=8 Q heads) shares 1 KV head
+  // Computation: same as MHA from FLOPS perspective (each Q head does full attn)
+  if(!isDec){
+    o.push({s:"Attention",t:"M",
+      op:`Q×K^T: ${ht}h × (${S}×${Hd})×(${Hd}×${S}) → scores(${S}×${S})`,
+      fg:ht*mm(S,Hd,S),fa:H*mm(S,Hd,S),
+      par:`head÷${TP}`,comm:"",cs:0});
+    o.push({s:"Attention",t:"E",
+      op:`Scale÷√${Hd} + Mask + Softmax: (${ht}h×${S}×${S})`,
+      fg:7*ht*S*S,fa:7*H*S*S,
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"Attention",t:"M",
+      op:`Weights×V: ${ht}h × (${S}×${S})×(${S}×${Hd}) → out(${S}×${Hd})`,
+      fg:ht*mm(S,S,Hd),fa:H*mm(S,S,Hd),
+      par:`head÷${TP}`,comm:"",cs:0});
+  } else {
+    o.push({s:"Attention",t:"M",
+      op:`Q×K^T: ${ht}h × (1×${Hd})×(${Hd}×${Skv}) → scores(1×${Skv})`,
+      fg:ht*mm(1,Hd,Skv),fa:H*mm(1,Hd,Skv),
+      par:`head÷${TP}`,comm:"",cs:0});
+    o.push({s:"Attention",t:"E",
+      op:`Scale + Softmax: (${ht}h×1×${Skv})`,
+      fg:7*ht*Skv,fa:7*H*Skv,
+      par:`÷${TP}`,comm:"",cs:0});
+    o.push({s:"Attention",t:"M",
+      op:`Weights×V: ${ht}h × (1×${Skv})×(${Skv}×${Hd}) → out(1×${Hd})`,
+      fg:ht*mm(1,Skv,Hd),fa:H*mm(1,Skv,Hd),
+      par:`head÷${TP}`,comm:"",cs:0});
+  }
+
+  // ===== W_o + AllReduce =====
+  const oIn=ht*Hd;
+  const arD=Sq*D*bpe;
+  o.push({s:"Attn出力",t:"M",
+    op:`W_o: (${Sq}×${oIn})×(${oIn}×${D}) → partial(${Sq}×${D}) → AR`,
+    fg:mm(Sq,oIn,D),fa:mm(Sq,QDim,D),
+    par:`行分割÷${TP}`,comm:`★AR#1(TP=${TP})`,cs:arS(arD,TP)});
+
+  // ===== Residual + RMSNorm =====
+  o.push({s:"残差①",t:"E",
+    op:`加算: (${Sq}×${D})`,
+    fg:Sq*D,fa:Sq*D*TP,par:"replicated",comm:"",cs:0});
+  o.push({s:"RMSNorm②",t:"E",
+    op:`正規化: (${Sq}×${D})`,
+    fg:5*Sq*D,fa:5*Sq*D*TP,par:"replicated",comm:"",cs:0});
+
+  // ===== Router =====
+  o.push({s:"Router",t:"M",
+    op:`h×W_gate: (${Sq}×${D})×(${D}×${NE}) → scores(${Sq}×${NE})`,
+    fg:mm(Sq,D,NE),fa:mm(Sq,D,NE)*TP,
+    par:"★replicated",comm:"",cs:0});
+  o.push({s:"Router",t:"E",
+    op:`softmax + topk${KE} + norm: (${Sq}×${NE})`,
+    fg:10*Sq*NE,fa:10*Sq*NE*TP,
+    par:"replicated",comm:"",cs:0});
+
+  // ===== EP Dispatch =====
+  const a2a=Sq*KE*((EP-1)/EP)*D*bpe;
+  o.push({s:"EP Dispatch",t:"E",
+    op:`All-to-All: ${Sq}tok×${KE}exp×${((EP-1)/EP).toFixed(2)}×${D}dim×${bpe}B`,
+    fg:0,fa:0,
+    par:`EP=${EP} (${et}exp/GPU)`,comm:`★A2A#1(EP=${EP})`,cs:a2a});
+
+  // ===== Routed Experts (SwiGLU, no shared expert) =====
+  // Each expert: gate_up (D → 2*MI), SiLU, gate⊙up, down (MI → D)
+  o.push({s:`Expert×${KE}`,t:"M",
+    op:`Gate+Up: ${tpr.toFixed(0)}tok × (1×${D})×(${D}×${2*MI}) → (1×${2*MI})`,
+    fg:tpr*mm(1,D,2*MI),fa:KE*mm(Sq,D,2*MI),
+    par:`EP÷${EP}: ${et}exp/GPU`,comm:"",cs:0});
+  o.push({s:`Expert×${KE}`,t:"E",
+    op:`SiLU(gate)⊙up: ${tpr.toFixed(0)}tok × (1×${MI})`,
+    fg:tpr*5*MI,fa:KE*5*Sq*MI,
+    par:"",comm:"",cs:0});
+  o.push({s:`Expert×${KE}`,t:"M",
+    op:`Down: ${tpr.toFixed(0)}tok × (1×${MI})×(${MI}×${D}) → (1×${D})`,
+    fg:tpr*mm(1,MI,D),fa:KE*mm(Sq,MI,D),
+    par:`EP÷${EP}`,comm:"",cs:0});
+  o.push({s:`Expert×${KE}`,t:"E",
+    op:`重み付き合成: Σ(w×expert_out) (${Sq}×${D})`,
+    fg:KE*2*Sq*D/EP,fa:KE*2*Sq*D,
+    par:"",comm:"",cs:0});
+
+  // ===== EP Combine =====
+  o.push({s:"EP Combine",t:"E",
+    op:`All-to-All: Dispatchと対称`,
+    fg:0,fa:0,
+    par:"対称",comm:`★A2A#2(EP=${EP})`,cs:a2a});
+
+  // ===== No shared expert in gpt-oss! =====
+  // Instead, AllReduce is needed after EP Combine to sync across TP ranks
+  // Actually in pure EP mode, the token owner reassembles the expert outputs
+  // and the result is already in the correct TP rank (no AllReduce needed for MoE)
+  // But if TP>1 without EP, experts are TP-sharded → AllReduce needed
+  // For simplicity with TP+EP: EP handles experts, no additional AR for MoE
+  // (Unlike GLM-5 which has a shared expert requiring its own AR)
+
+  // ===== Residual 2 =====
+  o.push({s:"残差②",t:"E",
+    op:`加算: h + moe_out (${Sq}×${D})`,
+    fg:Sq*D,fa:Sq*D*TP,par:"replicated",comm:"",cs:0});
+
+  return o;
+}
+
+function grp(ops){const g=[];let c=null;for(const o of ops){if(!c||c.s!==o.s){c={s:o.s,ops:[]};g.push(c);}c.ops.push(o);}return g;}
+
+export default function App(){
+  const [mode,setMode]=useState("prefill");
+  const [S,setS]=useState(1000);
+  const [Skv,setSkv]=useState(4096);
+  const [TP,setTP]=useState(1);
+  const [EP,setEP]=useState(1);
+  const isDec=mode==="decode";
+  const ops=build(S,Skv,isDec,TP,EP);
+  const groups=grp(ops);
+  const gpuF=ops.reduce((a,o)=>a+o.fg,0);
+  const allF=ops.reduce((a,o)=>a+o.fa,0);
+  const gpuSend=ops.reduce((a,o)=>a+o.cs,0);
+  const arS_=ops.filter(o=>o.comm.includes("AR")).reduce((a,o)=>a+o.cs,0);
+  const a2aS_=ops.filter(o=>o.comm.includes("A2A")).reduce((a,o)=>a+o.cs,0);
+  const replF=ops.filter(o=>o.par.includes("replicated")||o.par.includes("★replicated")).reduce((a,o)=>a+o.fg,0);
+
+  const secS=groups.map(g=>({n:g.s,fg:g.ops.reduce((a,o)=>a+o.fg,0),cs:g.ops.reduce((a,o)=>a+o.cs,0)}));
+  const mxF=Math.max(...secS.map(x=>x.fg),1);
+  const mxC=Math.max(...secS.map(x=>x.cs),1);
+  const pc=isDec?"#E8734A":"#22AA77";
+
+  // KV cache per token per layer
+  const kvCachePerTok = KVH * Hd * 2 * 2; // 8*64*2(K+V)*2(BF16) = 2048 bytes
+  const kvCacheTotal = (isDec?Skv:S) * kvCachePerTok * NL;
+
+  return(
+    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#0a0a0a,#0f1018,#0a0a10)",color:"#e0e0ec",fontFamily:"'IBM Plex Sans','Noto Sans JP',system-ui,sans-serif",padding:"14px 8px"}}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+      <div style={{maxWidth:1200,margin:"0 auto"}}>
+        <div style={{textAlign:"center",marginBottom:10}}>
+          <h1 style={{fontSize:18,fontWeight:700,color:"#f0f0f5",margin:0}}>
+            <span style={{color:"#22AA77"}}>gpt-oss-120b</span> — 1層 FLOPS・通信 (全て1GPUあたり)
+          </h1>
+          <p style={{fontSize:10,color:"#666",margin:"3px 0 0"}}>
+            117B params, 5.1B active | 36層 | GQA(64h/8kv) | 128 experts top-4 | hidden=2880 | sliding_window=128交互
+          </p>
+        </div>
+
+        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:7,marginBottom:10,flexWrap:"wrap"}}>
+          {[{k:"prefill",l:"プリフィル"},{k:"decode",l:"デコード"}].map(m=>(
+            <button key={m.k} onClick={()=>setMode(m.k)} style={{padding:"5px 13px",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",
+              border:mode===m.k?`2px solid ${m.k==="prefill"?"#22AA77":"#E8734A"}`:"2px solid rgba(255,255,255,0.08)",
+              background:mode===m.k?`${m.k==="prefill"?"#22AA77":"#E8734A"}18`:"transparent",
+              color:mode===m.k?(m.k==="prefill"?"#44DDAA":"#FFB088"):"#666"}}>{m.l}</button>
+          ))}
+          {[{l:isDec?"S_kv":"S",v:isDec?Skv:S,fn:isDec?setSkv:setS},{l:"TP",v:TP,fn:setTP},{l:"EP",v:EP,fn:setEP}].map((c,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:3}}>
+              <label style={{fontSize:9,color:"#888"}}>{c.l}=</label>
+              <input type="number" value={c.v} onChange={e=>{c.fn(Math.max(1,parseInt(e.target.value)||1));}}
+                style={{width:50,padding:"3px 5px",borderRadius:4,border:"1px solid rgba(255,255,255,0.12)",background:"rgba(255,255,255,0.05)",color:"#ddd",fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}/>
+            </div>
+          ))}
+        </div>
+
+        {/* Summary */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5,marginBottom:9}}>
+          {[
+            {l:"FLOPS/GPU/層",v:fmt(gpuF),u:`×${NL}=${fmt(gpuF*NL)}`,c:"#e0e0f0"},
+            {l:"冗長(replicated)",v:fmt(replF),u:pct(replF,gpuF),c:"#ffcc44"},
+            {l:"分割計算",v:fmt(gpuF-replF),u:pct(gpuF-replF,gpuF),c:"#44DDAA"},
+            {l:"送信/GPU/層",v:fB(gpuSend),u:`×${NL}=${fB(gpuSend*NL)}`,c:"#ffaa66"},
+            {l:"AR送信(TP)",v:fB(arS_),u:"×1回/層",c:"#66bbff"},
+            {l:"A2A送信(EP)",v:fB(a2aS_),u:"×2回/層",c:"#cc66ff"},
+            {l:"KVcache合計",v:fB(kvCacheTotal),u:`${fB(kvCachePerTok)}/tok/層`,c:"#ff8888"},
+          ].map((c,i)=>(
+            <div key={i} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:6,padding:"6px 6px",textAlign:"center"}}>
+              <div style={{fontSize:7,color:"#666",textTransform:"uppercase",letterSpacing:0.6}}>{c.l}</div>
+              <div style={{fontSize:11.5,fontWeight:700,color:c.c,fontFamily:"'IBM Plex Mono',monospace",margin:"1px 0"}}>{c.v}</div>
+              <div style={{fontSize:8,color:"#555"}}>{c.u}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Bars */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:9}}>
+          {[{ti:"FLOPS/GPU",k:"fg",mx:mxF,u:fmt,co:pc},{ti:"送信/GPU",k:"cs",mx:mxC,u:fB,co:"#cc66ff"}].map((ch,ci)=>(
+            <div key={ci} style={{padding:"7px 9px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:7}}>
+              <div style={{fontSize:8.5,fontWeight:600,color:"#777",marginBottom:4,textTransform:"uppercase",letterSpacing:0.8}}>{ch.ti}</div>
+              {secS.map((x,i)=>{const v=x[ch.k];return(
+                <div key={i} style={{display:"flex",alignItems:"center",marginBottom:2}}>
+                  <div style={{width:100,fontSize:9,color:"#999",flexShrink:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{x.n}</div>
+                  <div style={{flex:1,height:10,background:"rgba(255,255,255,0.03)",borderRadius:2,overflow:"hidden",marginRight:3}}>
+                    <div style={{height:"100%",width:`${ch.mx>0?Math.max(v>0?0.4:0,v/ch.mx*100):0}%`,background:`linear-gradient(90deg,${ch.co},${ch.co}88)`,borderRadius:2}}/>
+                  </div>
+                  <div style={{width:55,fontSize:9,color:"#aaa",fontFamily:"'IBM Plex Mono',monospace",textAlign:"right"}}>{v>0?ch.u(v):"—"}</div>
+                </div>
+              );})}
+            </div>
+          ))}
+        </div>
+
+        {/* Table */}
+        <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:7,overflow:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:10,minWidth:1000}}>
+            <thead>
+              <tr style={{background:"rgba(255,255,255,0.04)"}}>
+                {["セクション","演算 (名前 + 行列サイズ)","型","FLOPS/GPU","FLOPS/全GPU","分割","通信","送信/GPU"].map((h,i)=>(
+                  <th key={i} style={{padding:"5px 3px",textAlign:[3,4,7].includes(i)?"right":"left",color:"#777",fontWeight:600,fontSize:8,textTransform:"uppercase",letterSpacing:0.6,borderBottom:"1px solid rgba(255,255,255,0.06)",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map((g,gi)=>{
+                const sgf=g.ops.reduce((a,x)=>a+x.fg,0);
+                const sc=g.ops.reduce((a,x)=>a+x.cs,0);
+                return g.ops.map((op,oi)=>(
+                  <tr key={`${gi}-${oi}`} style={{borderBottom:"1px solid rgba(255,255,255,0.02)",background:oi===0?"rgba(255,255,255,0.008)":"transparent"}}>
+                    {oi===0&&<td rowSpan={g.ops.length} style={{padding:"3px",verticalAlign:"top",color:"#aaa",fontWeight:600,fontSize:9,borderRight:"1px solid rgba(255,255,255,0.03)",background:"rgba(255,255,255,0.005)",width:85}}>
+                      {g.s}
+                      <div style={{fontSize:8,color:"#555",marginTop:1,fontFamily:"'IBM Plex Mono',monospace"}}>
+                        {sgf>0&&<div>{fmt(sgf)}</div>}
+                        {sc>0&&<div style={{color:"#cc66ff"}}>{fB(sc)}</div>}
+                      </div>
+                    </td>}
+                    <td style={{padding:"3px 4px",color:"#d0d0e0",fontSize:10,fontFamily:"'IBM Plex Mono','Noto Sans JP',monospace",whiteSpace:"pre-wrap",lineHeight:1.35,maxWidth:380}}>{op.op}</td>
+                    <td style={{padding:"3px 2px"}}>
+                      <span style={{display:"inline-block",padding:"0px 3px",borderRadius:2,fontSize:8.5,fontWeight:700,
+                        background:op.t==="M"?"rgba(34,170,119,0.15)":"rgba(255,180,80,0.1)",
+                        color:op.t==="M"?"#44DDAA":"#FFBB66"}}>{op.t==="M"?"MM":"El"}</span>
+                    </td>
+                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#e0e0f0",fontWeight:600,fontSize:10,whiteSpace:"nowrap"}}>{op.fg>0?fmt(op.fg):"—"}</td>
+                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#777",fontSize:9,whiteSpace:"nowrap"}}>{op.fa>0?fmt(op.fa):"—"}</td>
+                    <td style={{padding:"3px 4px",fontSize:9,color:op.par.includes("★")?"#ffcc44":"#999",fontWeight:op.par.includes("★")?600:400,whiteSpace:"nowrap"}}>{op.par||"—"}</td>
+                    <td style={{padding:"3px 4px",fontSize:9,whiteSpace:"nowrap",
+                      color:op.comm.includes("AR")?"#66bbff":op.comm.includes("A2A")?"#cc66ff":"#555",
+                      fontWeight:op.cs>0?600:400}}>{op.comm||"—"}</td>
+                    <td style={{padding:"3px 4px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontSize:9,
+                      color:op.cs>0?"#ffaa66":"#444",fontWeight:op.cs>0?600:400,whiteSpace:"nowrap"}}>{op.cs>0?fB(op.cs):"—"}</td>
+                  </tr>
+                ));
+              })}
+              <tr style={{background:"rgba(255,255,255,0.05)",borderTop:"2px solid rgba(255,255,255,0.1)"}}>
+                <td colSpan={3} style={{padding:"5px 3px",fontWeight:700,color:"#f0f0f5",fontSize:10.5}}>合計/層</td>
+                <td style={{padding:"5px 3px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#f0f0f5",fontSize:10.5}}>{fmt(gpuF)}</td>
+                <td style={{padding:"5px 3px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#777",fontSize:9.5}}>{fmt(allF)}</td>
+                <td/><td style={{fontSize:9,color:"#ddd"}}>送信計</td>
+                <td style={{padding:"5px 3px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#ffaa66",fontSize:10.5}}>{fB(gpuSend)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* Architecture comparison note */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:10}}>
+          <div style={{padding:"9px 11px",background:"rgba(34,170,119,0.05)",border:"1px solid rgba(34,170,119,0.2)",borderRadius:7,fontSize:10,color:"#c8c8d8",lineHeight:1.65}}>
+            <strong style={{color:"#44DDAA"}}>gpt-oss-120b アーキテクチャ特徴</strong><br/><br/>
+            <strong>GQA (Grouped Query Attention):</strong><br/>
+            64 Qheads, 8 KVheads (グループサイズ8)。<br/>
+            MLA不使用→KVキャッシュは KVH×Hd×2 = {KVH*Hd*2}値/tok/層<br/>
+            = {fB(kvCachePerTok)}/tok/層 (BF16)<br/><br/>
+            <strong>Sliding + Full Attention交互:</strong><br/>
+            奇数層: sliding_window=128 (局所attention)<br/>
+            偶数層: full attention (全文脈参照)<br/>
+            → 半分の層でAttention計算量が大幅削減
+          </div>
+          <div style={{padding:"9px 11px",background:"rgba(255,200,50,0.04)",border:"1px solid rgba(255,200,50,0.15)",borderRadius:7,fontSize:10,color:"#c8c8d8",lineHeight:1.65}}>
+            <strong style={{color:"#ffcc44"}}>GLM-5との主要な違い</strong><br/><br/>
+            <strong>MLA vs GQA:</strong> GLM-5はMLA(KVcache=576/tok/層)、<br/>
+            gpt-ossはGQA(KVcache={kvCachePerTok}/tok/層)<br/>
+            → gpt-ossのKVキャッシュは{(kvCachePerTok/1152).toFixed(1)}倍大きい<br/><br/>
+            <strong>Expert構成:</strong> GLM-5: 256exp top-8 + 共有1<br/>
+            gpt-oss: 128exp top-4, 共有なし<br/>
+            → gpt-ossはAllReduceが1層1回(Attn出力のみ)<br/>
+            → GLM-5は1層2回(Attn出力 + 共有Expert)<br/><br/>
+            <strong>hidden_size:</strong> GLM-5=6144, gpt-oss=2880
+          </div>
+        </div>
+
+        <div style={{marginTop:7,padding:"6px 9px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",borderRadius:5,fontSize:9,color:"#666",lineHeight:1.5}}>
+          <span style={{color:"#44DDAA"}}>MM</span>=行列積(2MKN) <span style={{color:"#FFBB66"}}>El</span>=要素演算 <span style={{color:"#ffcc44"}}>★replicated</span>=冗長計算 <span style={{color:"#66bbff"}}>AR</span>=AllReduce <span style={{color:"#cc66ff"}}>A2A</span>=All-to-All |
+          TP=1,EP=1が単GPU(MXFP4で80GB内)の想定。Sliding window層の削減効果は未反映(全層Full Attentionで計算)。
+        </div>
+      </div>
+    </div>
+  );
+}
