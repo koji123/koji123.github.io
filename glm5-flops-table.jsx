@@ -1,0 +1,368 @@
+import { useState } from "react";
+
+// === GLM-5 constants ===
+const D=6144, H=64, Q_R=2048, KV_R=512;
+const D_nope=192, D_rope=64, D_qk=256, D_v=256;
+const N_exp=256, K_exp=8, MoE_I=2048, Sh_I=12288;
+const mm=(M,K,N)=>2*M*K*N;
+function fmt(n){
+  if(n>=1e15)return(n/1e15).toFixed(2)+"P";
+  if(n>=1e12)return(n/1e12).toFixed(2)+"T";
+  if(n>=1e9)return(n/1e9).toFixed(2)+"G";
+  if(n>=1e6)return(n/1e6).toFixed(2)+"M";
+  if(n>=1e3)return(n/1e3).toFixed(2)+"K";
+  return n.toFixed(0);
+}
+function fmtB(bytes){
+  if(bytes>=1e9)return(bytes/1e9).toFixed(2)+" GB";
+  if(bytes>=1e6)return(bytes/1e6).toFixed(2)+" MB";
+  if(bytes>=1e3)return(bytes/1e3).toFixed(2)+" KB";
+  return bytes+" B";
+}
+function pct(v,t){return t===0?"—":(v/t*100).toFixed(1)+"%";}
+
+// BF16 = 2 bytes, FP8 = 1 byte
+function buildOps(S, Skv, isDecode, TP, EP) {
+  const Sq = isDecode ? 1 : S;
+  const Skv_ = isDecode ? Skv : S;
+  const bpe = 2; // bytes per element (BF16)
+
+  // helpers for parallel split description
+  const tp = TP, ep = EP;
+  const hPerTp = H / tp; // heads per TP rank
+  const expPerEp = N_exp / ep; // experts per EP rank
+
+  // Each op: {sec, op, f(flops), t(M/E), par(parallelism description), comm(communication), commBytes}
+  const ops = [];
+
+  // ---- RMSNorm 1 ----
+  ops.push({sec:"RMSNorm①", op:"x², mean, √, ÷, ×γ", f:5*Sq*D, t:"E",
+    par:"各TPランクが全6144次元を保持 (replicated)", comm:"なし", cb:0});
+
+  // ---- Q projection ----
+  ops.push({sec:"Q射影", op:"Down: x×W_dq (6144→2048)", f:mm(Sq,D,Q_R), t:"M",
+    par:`W_dqを列分割: 各TPが6144×${Q_R/tp}を保持`, comm:"なし (後段で結合)", cb:0});
+  ops.push({sec:"Q射影", op:"Up nope: c_q×W_uq (→H×192)", f:mm(Sq,Q_R,H*D_nope), t:"M",
+    par:`各TPが${hPerTp}heads分を計算 (${Q_R}×${hPerTp*D_nope})`, comm:"なし", cb:0});
+  ops.push({sec:"Q射影", op:"Up rope: c_q×W_qr (→H×64)", f:mm(Sq,Q_R,H*D_rope), t:"M",
+    par:`各TPが${hPerTp}heads分を計算`, comm:"なし", cb:0});
+  ops.push({sec:"Q射影", op:"RoPE回転 (Q)", f:6*Sq*H*(D_rope/2), t:"E",
+    par:"head分割に沿って並列", comm:"なし", cb:0});
+
+  if(!isDecode) {
+    // ---- KV projection (prefill) ----
+    ops.push({sec:"KV射影", op:"Down: x×W_dkv (6144→512)", f:mm(S,D,KV_R), t:"M",
+      par:`W_dkvを列分割: 各TPが6144×${KV_R/tp}`, comm:"なし", cb:0});
+    ops.push({sec:"KV射影", op:"Up K: c_kv×W_uk (→H×192)", f:mm(S,KV_R,H*D_nope), t:"M",
+      par:`各TPが${hPerTp}heads分`, comm:"なし", cb:0});
+    ops.push({sec:"KV射影", op:"Up V: c_kv×W_uv (→H×256)", f:mm(S,KV_R,H*D_v), t:"M",
+      par:`各TPが${hPerTp}heads分`, comm:"なし", cb:0});
+    ops.push({sec:"KV射影", op:"K rope: x×W_kr (6144→64)", f:mm(S,D,D_rope), t:"M",
+      par:"全head共有→各TPで複製 or 1つが計算+broadcast", comm:"なし", cb:0});
+    ops.push({sec:"KV射影", op:"RoPE (K)", f:6*S*(D_rope/2), t:"E",
+      par:"並列", comm:"なし", cb:0});
+  } else {
+    // ---- KV projection (decode: new token only) ----
+    ops.push({sec:"KV射影(新tok)", op:"Down: x×W_dkv", f:mm(1,D,KV_R), t:"M",
+      par:`各TPが1×${KV_R/tp}を計算→キャッシュ追記`, comm:"なし", cb:0});
+    ops.push({sec:"KV射影(新tok)", op:"K rope: x×W_kr", f:mm(1,D,D_rope), t:"M",
+      par:"→キャッシュ追記", comm:"なし", cb:0});
+    ops.push({sec:"KV射影(新tok)", op:"RoPE (K)", f:6*1*(D_rope/2), t:"E",
+      par:"", comm:"なし", cb:0});
+  }
+
+  if(!isDecode) {
+    // ---- Attention (prefill) ----
+    ops.push({sec:"Attention", op:"Q×K^T (H heads)", f:H*mm(S,D_qk,S), t:"M",
+      par:`各TPが${hPerTp}heads分: (${S}×256)×(256×${S})×${hPerTp}h`, comm:"なし (head分割)", cb:0});
+    ops.push({sec:"Attention", op:"Scale+Mask+Softmax", f:7*H*S*S, t:"E",
+      par:`${hPerTp}heads/TP`, comm:"なし", cb:0});
+    ops.push({sec:"Attention", op:"Weights×V (H heads)", f:H*mm(S,S,D_v), t:"M",
+      par:`${hPerTp}heads/TP`, comm:"なし", cb:0});
+  } else {
+    // ---- Absorbed Attention (decode) ----
+    ops.push({sec:"Absorbed Attn", op:"Q'=Q_nope×W_uk^T (吸収)", f:H*mm(1,D_nope,KV_R), t:"M",
+      par:`各TPが${hPerTp}h分: (1×192)×(192×512)`, comm:"なし", cb:0});
+    ops.push({sec:"Absorbed Attn", op:"nope: Q'×c_kv^T", f:H*mm(1,KV_R,Skv), t:"M",
+      par:`${hPerTp}h/TP: (1×512)×(512×${Skv})`, comm:"なし", cb:0});
+    ops.push({sec:"Absorbed Attn", op:"rope: Q_rope×K_rope^T", f:H*mm(1,D_rope,Skv), t:"M",
+      par:`${hPerTp}h/TP`, comm:"なし", cb:0});
+    ops.push({sec:"Absorbed Attn", op:"合成+Softmax", f:7*H*1*Skv, t:"E",
+      par:"", comm:"なし", cb:0});
+    ops.push({sec:"V集約(Abs)", op:"weights×c_kv_cache", f:H*mm(1,Skv,KV_R), t:"M",
+      par:`${hPerTp}h/TP`, comm:"なし", cb:0});
+    ops.push({sec:"V集約(Abs)", op:"結果×W_uv (512→256)", f:H*mm(1,KV_R,D_v), t:"M",
+      par:`${hPerTp}h/TP`, comm:"なし", cb:0});
+  }
+
+  // ---- Output projection + AllReduce ----
+  const attnOutFlops = mm(Sq, H*D_v, D);
+  const arBytes_attn = Sq * D * bpe * 2 * (tp-1) / tp; // AllReduce ring: 2*(tp-1)/tp * data
+  ops.push({sec:"Attn出力", op:`W_o (16384→6144)`, f:attnOutFlops, t:"M",
+    par:`W_oを行分割: 各TPが${H*D_v/tp}×6144\n→ 部分和を計算`,
+    comm:`★ AllReduce (TP=${tp})`, cb:arBytes_attn});
+
+  // ---- Residual 1 ----
+  ops.push({sec:"残差①", op:"x + attn_out", f:Sq*D, t:"E",
+    par:"AllReduce後、全TPが同一結果を保持", comm:"なし", cb:0});
+
+  // ---- RMSNorm 2 ----
+  ops.push({sec:"RMSNorm②", op:"x², mean, √, ÷, ×γ", f:5*Sq*D, t:"E",
+    par:"replicated", comm:"なし", cb:0});
+
+  // ---- Router ----
+  ops.push({sec:"Router", op:"h×W_gate (6144→256)", f:mm(Sq,D,N_exp), t:"M",
+    par:"全TPで複製実行 (結果が全expertスコア必要)", comm:"なし", cb:0});
+  ops.push({sec:"Router", op:"sigmoid+topk+norm", f:10*Sq*N_exp, t:"E",
+    par:"", comm:"なし", cb:0});
+
+  // ---- EP Dispatch (All-to-All) ----
+  // Each token activates K_exp=8 experts. With EP, experts are distributed.
+  // Dispatch: send token hidden states to the EP rank that owns the expert
+  // Each token sends to ~8 experts, spread across ep ranks
+  // Data per token per dispatch: 8 * D * bpe, but only cross-rank portion
+  // Avg cross-rank: 8 * (ep-1)/ep * D * bpe per token
+  const dispatchPerTok = K_exp * ((ep-1)/ep) * D * bpe;
+  const dispatchTotal = Sq * dispatchPerTok;
+  ops.push({sec:"EP Dispatch", op:`All-to-All送信 (EP=${ep})`, f:0, t:"E",
+    par:`各トークンのh_norm(6144dim)を、選択された8 expertの\n所在EPランクへ送信。EP=${ep}なら各ランク${expPerEp}expert保持。\n平均${K_exp}×${((ep-1)/ep).toFixed(2)}=${(K_exp*(ep-1)/ep).toFixed(1)}回のクロスランク送信/トークン`,
+    comm:`★ All-to-All (EP=${ep})`, cb:dispatchTotal});
+
+  // ---- Routed Experts ×8 ----
+  // With EP, each rank computes only its local experts
+  // FLOPS per rank: (tokens_for_this_rank) * expert_flops
+  // Total model FLOPS unchanged, just distributed
+  ops.push({sec:"Expert×8", op:"Gate+Up ×8", f:K_exp*mm(Sq,D,2*MoE_I), t:"M",
+    par:`EP=${ep}: 各ランクが${expPerEp}expertを保持\n各ランクは自分のexpertに届いたトークンのみ計算\n(負荷は均等とは限らない)`, comm:"なし", cb:0});
+  ops.push({sec:"Expert×8", op:"SiLU+gate⊙up ×8", f:K_exp*5*Sq*MoE_I, t:"E",
+    par:"", comm:"なし", cb:0});
+  ops.push({sec:"Expert×8", op:"Down ×8", f:K_exp*mm(Sq,MoE_I,D), t:"M",
+    par:`各expertのW_downは分割なし (EP方式)`, comm:"なし", cb:0});
+  ops.push({sec:"Expert×8", op:"重み付き合成", f:K_exp*2*Sq*D, t:"E",
+    par:"", comm:"なし", cb:0});
+
+  // ---- EP Combine (All-to-All back) ----
+  // Send expert outputs back to original token owners
+  const combineTotal = dispatchTotal; // symmetric
+  ops.push({sec:"EP Combine", op:`All-to-All受信 (EP=${ep})`, f:0, t:"E",
+    par:`expert出力(6144dim)を元のトークン所有者へ返送。\nDispatchと対称的な通信量。`,
+    comm:`★ All-to-All (EP=${ep})`, cb:combineTotal});
+
+  // ---- Shared Expert ----
+  const sharedArBytes = Sq * D * bpe * 2 * (tp-1) / tp;
+  ops.push({sec:"共有Expert", op:"Gate+Up (6144→24576)", f:mm(Sq,D,2*Sh_I), t:"M",
+    par:`W_shared_gate_upを列分割: 各TPが6144×${2*Sh_I/tp}`, comm:"なし", cb:0});
+  ops.push({sec:"共有Expert", op:"SiLU+gate⊙up", f:5*Sq*Sh_I, t:"E",
+    par:"", comm:"なし", cb:0});
+  ops.push({sec:"共有Expert", op:`Down (12288→6144)`, f:mm(Sq,Sh_I,D), t:"M",
+    par:`W_shared_downを行分割: 各TPが${Sh_I/tp}×6144\n→ 部分和`,
+    comm:`★ AllReduce (TP=${tp})`, cb:sharedArBytes});
+
+  // ---- Combine + Residual 2 ----
+  ops.push({sec:"残差②", op:"routed+shared+h", f:2*Sq*D, t:"E",
+    par:"AllReduce後に加算", comm:"なし", cb:0});
+
+  return ops;
+}
+
+function groupOps(ops){
+  const g=[];let c=null;
+  for(const o of ops){if(!c||c.sec!==o.sec){c={sec:o.sec,ops:[]};g.push(c);}c.ops.push(o);}
+  return g;
+}
+
+export default function GLM5ParallelTable(){
+  const [mode,setMode]=useState("prefill");
+  const [S,setS]=useState(1000);
+  const [Skv,setSkv]=useState(4096);
+  const [TP,setTP]=useState(8);
+  const [EP,setEP]=useState(8);
+
+  const isDec = mode==="decode";
+  const ops = buildOps(S, Skv, isDec, TP, EP);
+  const groups = groupOps(ops);
+  const total = ops.reduce((s,o)=>s+o.f,0);
+  const totalComm = ops.reduce((s,o)=>s+o.cb,0);
+  const arComm = ops.filter(o=>o.comm.includes("AllReduce")).reduce((s,o)=>s+o.cb,0);
+  const a2aComm = ops.filter(o=>o.comm.includes("All-to-All")).reduce((s,o)=>s+o.cb,0);
+
+  const secSums = groups.map(g=>({name:g.sec, f:g.ops.reduce((s,o)=>s+o.f,0), cb:g.ops.reduce((s,o)=>s+o.cb,0)}));
+  const maxSec = Math.max(...secSums.map(s=>s.f), 1);
+  const maxComm = Math.max(...secSums.map(s=>s.cb), 1);
+  const pc = isDec?"#E8734A":"#4A90D9";
+
+  return(
+    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#08080e 0%,#0e0e1c 50%,#0a0a14 100%)",color:"#e0e0ec",fontFamily:"'IBM Plex Sans','Noto Sans JP',system-ui,sans-serif",padding:"18px 12px"}}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+      <div style={{maxWidth:1150,margin:"0 auto"}}>
+        <div style={{textAlign:"center",marginBottom:14}}>
+          <h1 style={{fontSize:20,fontWeight:700,color:"#f0f0f5",margin:0}}>GLM-5 — FLOPS + TP/EP並列化 + 通信量</h1>
+          <p style={{fontSize:11,color:"#666",margin:"4px 0 0"}}>Attention=TP(head分割), MoE Expert=EP(expert分割), 共有Expert=TP(列/行分割)</p>
+        </div>
+
+        {/* Controls */}
+        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+          {[{k:"prefill",l:"プリフィル"},{k:"decode",l:"デコード"}].map(m=>(
+            <button key={m.k} onClick={()=>setMode(m.k)} style={{
+              padding:"7px 16px",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer",
+              border:mode===m.k?`2px solid ${m.k==="prefill"?"#4A90D9":"#E8734A"}`:"2px solid rgba(255,255,255,0.08)",
+              background:mode===m.k?`${m.k==="prefill"?"#4A90D9":"#E8734A"}18`:"transparent",
+              color:mode===m.k?(m.k==="prefill"?"#6BB3FF":"#FFB088"):"#666",
+            }}>{m.l}</button>
+          ))}
+          {[
+            {label:isDec?"S_kv":"S", val:isDec?Skv:S, set:isDec?(v=>setSkv(v)):(v=>setS(v))},
+            {label:"TP", val:TP, set:setTP},
+            {label:"EP", val:EP, set:setEP},
+          ].map((c,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:4}}>
+              <label style={{fontSize:10,color:"#888"}}>{c.label}=</label>
+              <input type="number" value={c.val} onChange={e=>{const v=Math.max(1,parseInt(e.target.value)||1);c.set(v);}}
+                style={{width:55,padding:"4px 6px",borderRadius:5,border:"1px solid rgba(255,255,255,0.12)",background:"rgba(255,255,255,0.05)",color:"#ddd",fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+            </div>
+          ))}
+        </div>
+
+        {/* Summary */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:7,marginBottom:12}}>
+          {[
+            {l:"FLOPS/層",v:fmt(total),s:`×78=${fmt(total*78)}`},
+            {l:"通信量/層",v:fmtB(totalComm),s:`×78=${fmtB(totalComm*78)}`},
+            {l:"AllReduce(TP)",v:fmtB(arComm),s:`Attn出力+共有Expert`},
+            {l:"All-to-All(EP)",v:fmtB(a2aComm),s:`Dispatch+Combine`},
+            {l:`Expert/EPランク`,v:`${Math.ceil(256/EP)}個`,s:`256÷EP=${EP}`},
+          ].map((c,i)=>(
+            <div key={i} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:8,padding:"8px 10px",textAlign:"center"}}>
+              <div style={{fontSize:8.5,color:"#666",textTransform:"uppercase",letterSpacing:1}}>{c.l}</div>
+              <div style={{fontSize:14,fontWeight:700,color:"#e0e0f0",fontFamily:"'IBM Plex Mono',monospace",margin:"2px 0"}}>{c.v}</div>
+              <div style={{fontSize:9.5,color:"#555"}}>{c.s}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Dual bar chart: FLOPS + Comm */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          {[{title:"FLOPS分布",data:secSums.map(s=>({n:s.name,v:s.f})),max:maxSec,unit:fmt,color:pc},
+            {title:"通信量分布",data:secSums.map(s=>({n:s.name,v:s.cb})),max:maxComm,unit:fmtB,color:"#cc66ff"}
+          ].map((chart,ci)=>(
+            <div key={ci} style={{padding:"10px 12px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:9}}>
+              <div style={{fontSize:9.5,fontWeight:600,color:"#777",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>{chart.title}</div>
+              {chart.data.map((s,i)=>(
+                <div key={i} style={{display:"flex",alignItems:"center",marginBottom:3}}>
+                  <div style={{width:115,fontSize:9.5,color:"#999",flexShrink:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{s.n}</div>
+                  <div style={{flex:1,height:12,background:"rgba(255,255,255,0.03)",borderRadius:2,overflow:"hidden",marginRight:4}}>
+                    <div style={{height:"100%",width:`${chart.max>0?Math.max(s.v>0?0.5:0,s.v/chart.max*100):0}%`,background:`linear-gradient(90deg,${chart.color},${chart.color}88)`,borderRadius:2}}/>
+                  </div>
+                  <div style={{width:65,fontSize:9.5,color:"#aaa",fontFamily:"'IBM Plex Mono',monospace",textAlign:"right"}}>{s.v>0?chart.unit(s.v):"—"}</div>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+
+        {/* Main Table */}
+        <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:9,overflow:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:900}}>
+            <thead>
+              <tr style={{background:"rgba(255,255,255,0.04)"}}>
+                {["セクション","演算","型","FLOPS","並列化 (TP/EP分割)","通信","通信量"].map((h,i)=>(
+                  <th key={i} style={{padding:"7px 5px",textAlign:i===3||i===6?"right":"left",color:"#777",fontWeight:600,fontSize:9,textTransform:"uppercase",letterSpacing:0.8,borderBottom:"1px solid rgba(255,255,255,0.06)",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map((g,gi)=>{
+                const sf=g.ops.reduce((s,o)=>s+o.f,0);
+                const sc=g.ops.reduce((s,o)=>s+o.cb,0);
+                return g.ops.map((op,oi)=>(
+                  <tr key={`${gi}-${oi}`} style={{borderBottom:"1px solid rgba(255,255,255,0.02)",background:oi===0?"rgba(255,255,255,0.01)":"transparent"}}>
+                    {oi===0&&<td rowSpan={g.ops.length} style={{padding:"5px",verticalAlign:"top",color:"#aaa",fontWeight:600,fontSize:10,borderRight:"1px solid rgba(255,255,255,0.03)",background:"rgba(255,255,255,0.005)",width:100}}>
+                      {g.sec}
+                      <div style={{fontSize:9,color:"#555",marginTop:2,fontFamily:"'IBM Plex Mono',monospace"}}>
+                        {sf>0&&<span>{fmt(sf)}</span>}
+                        {sc>0&&<span style={{color:"#cc66ff",marginLeft:4}}>{fmtB(sc)}</span>}
+                      </div>
+                    </td>}
+                    <td style={{padding:"4px 5px",color:"#c0c0d0",fontSize:10.5}}>{op.op}</td>
+                    <td style={{padding:"4px 3px"}}>
+                      <span style={{display:"inline-block",padding:"1px 4px",borderRadius:3,fontSize:9,fontWeight:600,
+                        background:op.t==="M"?"rgba(74,144,217,0.12)":"rgba(255,180,80,0.08)",
+                        color:op.t==="M"?"#6BB3FF":"#FFBB66"}}>
+                        {op.t==="M"?"MM":"El"}
+                      </span>
+                    </td>
+                    <td style={{padding:"4px 5px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#e0e0f0",fontWeight:500,fontSize:10.5,whiteSpace:"nowrap"}}>
+                      {op.f>0?fmt(op.f):"—"}
+                    </td>
+                    <td style={{padding:"4px 5px",fontSize:9.5,color:"#999",fontFamily:"'IBM Plex Mono',monospace",maxWidth:220,whiteSpace:"pre-wrap",lineHeight:1.45}}>{op.par}</td>
+                    <td style={{padding:"4px 5px",fontSize:9.5,whiteSpace:"nowrap",
+                      color:op.comm.includes("AllReduce")?"#66bbff":op.comm.includes("All-to-All")?"#cc66ff":"#555",
+                      fontWeight:op.cb>0?600:400}}>
+                      {op.comm}
+                    </td>
+                    <td style={{padding:"4px 5px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontSize:10,
+                      color:op.cb>0?"#ffaa66":"#444",fontWeight:op.cb>0?600:400,whiteSpace:"nowrap"}}>
+                      {op.cb>0?fmtB(op.cb):"—"}
+                    </td>
+                  </tr>
+                ));
+              })}
+              <tr style={{background:"rgba(255,255,255,0.05)",borderTop:"2px solid rgba(255,255,255,0.1)"}}>
+                <td colSpan={3} style={{padding:"7px 5px",fontWeight:700,color:"#f0f0f5",fontSize:11}}>合計 (1層)</td>
+                <td style={{padding:"7px 5px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#f0f0f5",fontSize:11}}>{fmt(total)}</td>
+                <td/>
+                <td style={{padding:"7px 5px",fontWeight:600,color:"#ddd",fontSize:10}}>通信計</td>
+                <td style={{padding:"7px 5px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#ffaa66",fontSize:11}}>{fmtB(totalComm)}</td>
+              </tr>
+              <tr style={{background:"rgba(255,255,255,0.03)"}}>
+                <td colSpan={3} style={{padding:"5px",color:"#777",fontSize:10}}>×78層</td>
+                <td style={{padding:"5px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#aaa",fontSize:10}}>{fmt(total*78)}</td>
+                <td/>
+                <td/>
+                <td style={{padding:"5px",textAlign:"right",fontFamily:"'IBM Plex Mono',monospace",color:"#cc8844",fontSize:10}}>{fmtB(totalComm*78)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* Explanation panel */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:12}}>
+          <div style={{padding:"11px 13px",background:"rgba(74,144,217,0.06)",border:"1px solid rgba(74,144,217,0.2)",borderRadius:9,fontSize:11,color:"#c8c8d8",lineHeight:1.7}}>
+            <strong style={{color:"#6BB3FF"}}>TP (Tensor Parallelism) — AllReduce</strong><br/>
+            <strong>Attention層:</strong> head分割。64headsをTP={TP}で分割→各{H/TP}heads。<br/>
+            各ランクが自分のheads分のQ,K,V,Attnを独立計算。<br/>
+            W_oの後に<strong>AllReduce</strong>で部分和を集約。<br/>
+            <br/>
+            <strong>共有Expert:</strong> 通常FFNと同じ列/行分割。<br/>
+            W_gate_upを列分割、W_downを行分割。<br/>
+            W_downの後に<strong>AllReduce</strong>。<br/>
+            <br/>
+            通信量 = S×6144×2bytes×2×(TP-1)/TP per AllReduce<br/>
+            <strong>1層に2回</strong>のAllReduce (Attn後 + 共有Expert後)
+          </div>
+          <div style={{padding:"11px 13px",background:"rgba(204,102,255,0.06)",border:"1px solid rgba(204,102,255,0.2)",borderRadius:9,fontSize:11,color:"#c8c8d8",lineHeight:1.7}}>
+            <strong style={{color:"#cc66ff"}}>EP (Expert Parallelism) — All-to-All</strong><br/>
+            <strong>ルーテッドExpert:</strong> 256 expertをEP={EP}で分割→各{Math.ceil(256/EP)}experts。<br/>
+            <br/>
+            <strong>Dispatch:</strong> 各トークンのhidden(6144dim)を、<br/>
+            選択された8 expertの所在ランクへAll-to-All送信。<br/>
+            平均クロスランク率: (EP-1)/EP = {((EP-1)/EP*100).toFixed(0)}%<br/>
+            <br/>
+            <strong>Combine:</strong> expert出力を元のランクへ返送。<br/>
+            Dispatchと対称。<br/>
+            <br/>
+            通信量 = S×8×{((EP-1)/EP).toFixed(2)}×6144×2bytes × 2(往復)<br/>
+            <strong>1層に2回</strong>のAll-to-All (Dispatch + Combine)
+          </div>
+        </div>
+
+        <div style={{marginTop:10,padding:"9px 12px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",borderRadius:7,fontSize:10,color:"#666",lineHeight:1.6}}>
+          <strong style={{color:"#888"}}>注記:</strong> TP,EP,Sは上部で変更可能。典型構成: 8×H100→TP=8,EP=8 (vllm --tensor-parallel-size 8)。
+          AllReduceはRingで 2×(N-1)/N×data。All-to-Allはルーティングのばらつきで変動(表は平均)。
+          デコード時のAll-to-Allは1トークン分なのでレイテンシ支配(帯域ではなくRTT)。
+          Sequence Parallelism(SP)は省略。BF16前提(FP8なら通信量半減)。
+        </div>
+      </div>
+    </div>
+  );
+}
