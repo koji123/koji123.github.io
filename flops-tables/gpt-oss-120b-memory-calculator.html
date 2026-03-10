@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gpt-oss-120b GPU Memory Calculator</title>
+  <style>body{margin:0;}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+const { useState, useMemo } = React;
+// ═══════════════════════════════════════════════════════════════
+// gpt-oss-120b Architecture Constants (from HuggingFace config.json)
+// Architecture: GptOssForCausalLM (MoE + alternating sliding/full attention + GQA)
+// ═══════════════════════════════════════════════════════════════
+const M = {
+  hidden_size: 2880,
+  num_layers: 36,
+  num_attention_heads: 64,
+  num_kv_heads: 8,             // GQA with group_size=8
+  head_dim: 64,
+  intermediate_size: 2880,     // SwiGLU expert FFN dim
+  num_local_experts: 128,
+  num_experts_per_tok: 4,
+  vocab_size: 201088,
+  max_position_embeddings: 131072,
+  sliding_window: 128,         // alternating sliding(128)/full attention layers
+  attention_bias: true,
+  // layer_types: alternating "sliding_attention", "full_attention" × 18 each
+  num_sliding_layers: 18,
+  num_full_layers: 18,
+  // Quantization: MoE weights natively in MXFP4; attn, router, embed, lm_head in BF16
+};
+
+const fmtGB = (b) => (b / 1024 ** 3).toFixed(2);
+
+const Btn = ({ active, onClick, children, color = "#5b9cf5", disabled }) => (
+  <button onClick={disabled ? undefined : onClick} style={{
+    padding: "7px 0", borderRadius: 6, border: "none",
+    cursor: disabled ? "not-allowed" : "pointer",
+    fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+    fontSize: 13, fontWeight: 700, flex: 1,
+    background: active ? color : "#1a2030",
+    color: active ? (["#ddcc44", "#f5e55b"].includes(color) ? "#0a0f1a" : "#fff") : "#6b7a8d",
+    transition: "all 0.15s", opacity: disabled ? 0.25 : 1,
+  }}>{children}</button>
+);
+
+const Bar = ({ label, bytes, total, color, note }) => {
+  const pct = total > 0 ? (bytes / total) * 100 : 0;
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 2, gap: 8 }}>
+        <span style={{ color: "#c4cad4", whiteSpace: "nowrap" }}>
+          {label} {note && <span style={{ color: "#555e6e", fontSize: 10 }}>({note})</span>}
+        </span>
+        <span style={{ fontFamily: "monospace", color: "#e8ecf1", fontWeight: 600, whiteSpace: "nowrap" }}>
+          {fmtGB(bytes)} GB
+        </span>
+      </div>
+      <div style={{ height: 12, background: "#111825", borderRadius: 6, overflow: "hidden", position: "relative" }}>
+        <div style={{
+          height: "100%", width: `${Math.min(pct, 100)}%`, background: color,
+          borderRadius: 6, transition: "width 0.3s ease", boxShadow: `0 0 6px ${color}30`,
+        }} />
+        <span style={{
+          position: "absolute", right: 5, top: 0, lineHeight: "12px",
+          fontSize: 8, fontFamily: "monospace", color: "#667788",
+        }}>{pct.toFixed(1)}%</span>
+      </div>
+    </div>
+  );
+};
+
+const Section = ({ title, color, children }) => (
+  <div style={{
+    background: "#131b2b", borderRadius: 10, padding: 16,
+    border: "1px solid #1e293b", marginBottom: 14,
+  }}>
+    <h3 style={{
+      fontSize: 12, fontWeight: 700, color, margin: "0 0 12px",
+      textTransform: "uppercase", letterSpacing: "0.08em",
+    }}>{title}</h3>
+    {children}
+  </div>
+);
+
+const Stat = ({ label, value, color = "#e8ecf1" }) => (
+  <div style={{ textAlign: "center" }}>
+    <div style={{ fontSize: 10, color: "#6b7a8d", marginBottom: 2 }}>{label}</div>
+    <div style={{ fontFamily: "monospace", fontSize: 18, fontWeight: 800, color }}>{value}</div>
+  </div>
+);
+
+// Color palette
+const C = {
+  emb: "#4da6ff", attn: "#ff9944", dense: "#44dd88", router: "#88dd44",
+  routed: "#ff4477", lm: "#aaaaaa", norm: "#44cccc", act: "#44ffaa",
+  kv: "#ff5555",
+};
+
+function App() {
+  const [tp, setTp] = useState(1);
+  const [ep, setEp] = useState(1);
+  const [kvTokens, setKvTokens] = useState(32768);
+  // gpt-oss has mixed precision: MoE weights in MXFP4 (0.5B/param), rest in BF16 (2B/param)
+  // User can switch between native MXFP4 and BF16-upcast modes
+  const [moePrec, setMoePrec] = useState(0.5); // 0.5 = MXFP4, 1 = FP8, 2 = BF16
+  const [attnPrec, setAttnPrec] = useState(2);  // attention always BF16 by default
+  const [kvBytes, setKvBytes] = useState(2);
+  const [gpuGB, setGpuGB] = useState(80);
+
+  const effectiveEp = Math.max(tp, ep);
+  const totalGPUs = effectiveEp;
+  const dpSize = totalGPUs / tp;
+
+  const calc = useMemo(() => {
+    const aB = attnPrec;   // bytes per attn weight
+    const mB = moePrec;    // bytes per MoE weight
+    const kvB = kvBytes;
+    const expertsPerGpu = Math.ceil(M.num_local_experts / effectiveEp);
+
+    // ── 1. EMBEDDING ──
+    // Not quantized (BF16)
+    const embedding = (M.vocab_size * M.hidden_size / tp) * 2; // always BF16
+
+    // ── 2. ATTENTION (GQA) ──
+    // q_proj: hidden_size → num_heads * head_dim = 64*64 = 4096
+    // k_proj: hidden_size → num_kv_heads * head_dim = 8*64 = 512
+    // v_proj: hidden_size → num_kv_heads * head_dim = 8*64 = 512
+    // o_proj: num_heads * head_dim → hidden_size = 4096 → 2880
+    // With attention_bias=true, add bias terms
+    const q_proj = M.hidden_size * (M.num_attention_heads * M.head_dim);
+    const k_proj = M.hidden_size * (M.num_kv_heads * M.head_dim);
+    const v_proj = M.hidden_size * (M.num_kv_heads * M.head_dim);
+    const o_proj = (M.num_attention_heads * M.head_dim) * M.hidden_size;
+    const q_bias = M.num_attention_heads * M.head_dim;
+    const k_bias = M.num_kv_heads * M.head_dim;
+    const v_bias = M.num_kv_heads * M.head_dim;
+    const o_bias = M.hidden_size;
+    const attnWeights = q_proj + k_proj + v_proj + o_proj;
+    const attnBias = q_bias + k_bias + v_bias + o_bias;
+    // Attention is TP-sharded on head dim
+    const attnPerLayer = ((attnWeights / tp) + (attnBias / tp)) * aB;
+    const totalAttn = M.num_layers * attnPerLayer;
+
+    // ── 3. MoE EXPERT WEIGHTS ──
+    // SwiGLU: gate_proj + up_proj + down_proj
+    // gate_proj: hidden_size → intermediate_size
+    // up_proj: hidden_size → intermediate_size
+    // down_proj: intermediate_size → hidden_size
+    const paramsPerExpert = 3 * M.hidden_size * M.intermediate_size;
+    const routedExpPerLayer = expertsPerGpu * paramsPerExpert * mB;
+    const totalRoutedExp = M.num_layers * routedExpPerLayer;
+
+    // ── 4. ROUTER GATE ──
+    // router: hidden_size → num_local_experts (replicated, BF16)
+    const routerPerLayer = M.hidden_size * M.num_local_experts * 2; // always BF16
+    const totalRouter = M.num_layers * routerPerLayer;
+
+    // ── 5. LAYER NORMS (replicated, BF16) ──
+    // input_layernorm + post_attention_layernorm per layer
+    const totalLayerNorm = M.num_layers * (M.hidden_size * 2) * 2;
+
+    // ── 6. LM HEAD (BF16) ──
+    const lmHead = (M.hidden_size * M.vocab_size / tp) * 2;
+
+    const totalWeights = embedding + totalAttn + totalRoutedExp + totalRouter + totalLayerNorm + lmHead;
+
+    // ── 7. KV CACHE ──
+    // Standard GQA KV cache: per token per layer stores K and V
+    // K: num_kv_heads * head_dim = 8 * 64 = 512 elements
+    // V: num_kv_heads * head_dim = 8 * 64 = 512 elements
+    // Total: 1024 elements per token per layer
+    // With TP: KV heads are sharded across TP ranks
+    const kvHeadsPerGpu = Math.max(1, M.num_kv_heads / tp);
+    const kvPerTokenPerLayer = kvHeadsPerGpu * M.head_dim * 2 * kvB; // K+V
+    const kvCacheTotal = kvTokens * M.num_layers * kvPerTokenPerLayer;
+
+    // ── 8. ACTIVATIONS (rough estimate) ──
+    const activations = M.hidden_size * 4 * 2048 * 2;
+
+    const totalMemory = totalWeights + kvCacheTotal + activations;
+
+    return {
+      expertsPerGpu, embedding, totalAttn, totalRoutedExp, totalRouter,
+      totalLayerNorm, lmHead, totalWeights,
+      kvCacheTotal, kvPerTokenPerLayer, kvHeadsPerGpu,
+      activations, totalMemory,
+    };
+  }, [tp, effectiveEp, kvTokens, attnPrec, moePrec, kvBytes]);
+
+  const gpuMemBytes = gpuGB * 1024 ** 3;
+  const util = (calc.totalMemory / gpuMemBytes) * 100;
+  const tpOpts = [1, 2, 4, 8];
+  const epOpts = [1, 2, 4, 8, 16, 32, 64, 128];
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(145deg, #0a0e18 0%, #10172a 50%, #0b1020 100%)",
+      color: "#e8ecf1",
+      fontFamily: "'IBM Plex Sans', 'Noto Sans JP', system-ui, sans-serif",
+      padding: "24px 16px",
+    }}>
+      <div style={{ maxWidth: 920, margin: "0 auto" }}>
+        {/* Header */}
+        <div style={{ marginBottom: 24, borderBottom: "1px solid #1e293b", paddingBottom: 14 }}>
+          <h1 style={{
+            fontSize: 22, fontWeight: 800, margin: 0, letterSpacing: "-0.02em",
+            background: "linear-gradient(135deg, #44dd88, #4da6ff)",
+            WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+          }}>
+            gpt-oss-120b GPU Memory Calculator
+          </h1>
+          <p style={{ fontSize: 12, color: "#6b7a8d", margin: "6px 0 0" }}>
+            117B total · 5.1B active · 128 experts × top-4 · GQA (8 KV heads) · Sliding+Full Attention · MXFP4 MoE · vLLM parallelism
+          </p>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+          {/* LEFT: Controls */}
+          <div>
+            <Section title="Parallelism (vLLM)" color="#4da6ff">
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                  <span style={{ fontFamily: "monospace", fontSize: 13, color: "#c4cad4" }}>Tensor Parallel (TP)</span>
+                  <span style={{ fontFamily: "monospace", fontSize: 18, fontWeight: 700 }}>{tp}</span>
+                </div>
+                <div style={{ fontSize: 11, color: "#6b7a8d", marginBottom: 6, fontStyle: "italic" }}>
+                  Attention & Expert(EP未使用時)のシャーディング
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {tpOpts.map(v => (
+                    <Btn key={v} active={tp === v} onClick={() => setTp(v)} color="#4da6ff">{v}</Btn>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                  <span style={{ fontFamily: "monospace", fontSize: 13, color: "#c4cad4" }}>Expert Parallel (EP)</span>
+                  <span style={{ fontFamily: "monospace", fontSize: 18, fontWeight: 700 }}>{ep}</span>
+                </div>
+                <div style={{ fontSize: 11, color: "#6b7a8d", marginBottom: 6, fontStyle: "italic" }}>
+                  Routed Expert分散 (EP = TP × DP)
+                </div>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {epOpts.map(v => (
+                    <Btn key={v} active={ep === v} onClick={() => setEp(v)} color="#ff4477"
+                      disabled={v < tp}>{v}</Btn>
+                  ))}
+                </div>
+                {ep < tp && (
+                  <div style={{ fontSize: 10, color: "#ddaa44", marginTop: 4 }}>
+                    ⚠ EP({ep}) &lt; TP({tp}) → EP={tp}に補正
+                  </div>
+                )}
+              </div>
+
+              <div style={{
+                background: "#0b1220", borderRadius: 8, padding: 10,
+                display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6,
+              }}>
+                <Stat label="Total GPUs" value={totalGPUs} color="#44dd88" />
+                <Stat label="DP (Attn)" value={dpSize} color="#ddcc44" />
+                <Stat label="Experts/GPU" value={calc.expertsPerGpu} color="#ff4477" />
+              </div>
+              <div style={{ fontSize: 10, color: "#3d4d5d", marginTop: 8, lineHeight: 1.7, fontFamily: "monospace" }}>
+                Attention: DP={dpSize}レプリカ × TP={tp}分割 (GQA {M.num_kv_heads}kv_heads)<br/>
+                &nbsp;&nbsp;KV heads/GPU: {calc.kvHeadsPerGpu} (min 1)<br/>
+                MoE: {M.num_local_experts}experts → EP{effectiveEp}分散 = {calc.expertsPerGpu}/GPU<br/>
+                KV Cache: DP毎に独立、TP間でKV head分割
+              </div>
+            </Section>
+
+            <Section title="KV Cache (GQA)" color="#ff5555">
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                  <span style={{ fontFamily: "monospace", fontSize: 12, color: "#99aabb" }}>KV Cache Tokens</span>
+                  <span style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 700 }}>{kvTokens.toLocaleString()}</span>
+                </div>
+                <input type="range" min={1024} max={2097152} step={1024} value={kvTokens}
+                  onChange={e => setKvTokens(+e.target.value)}
+                  style={{ width: "100%", accentColor: "#ff5555", height: 5, cursor: "pointer" }} />
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#3d4d5d" }}>
+                  <span>1K</span><span>128K</span><span>512K</span><span>1M</span><span>2M</span>
+                </div>
+              </div>
+              <div style={{
+                fontSize: 10, color: "#667788", lineHeight: 1.8, fontFamily: "monospace",
+                background: "#0b1220", borderRadius: 6, padding: 8,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>K cache (per tok/layer)</span>
+                  <span>{calc.kvHeadsPerGpu}heads × d{M.head_dim} × {kvBytes}B = <b style={{color:"#ff5555"}}>{calc.kvHeadsPerGpu * M.head_dim * kvBytes}B</b></span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>V cache (per tok/layer)</span>
+                  <span>{calc.kvHeadsPerGpu}heads × d{M.head_dim} × {kvBytes}B = <b style={{color:"#ff5555"}}>{calc.kvHeadsPerGpu * M.head_dim * kvBytes}B</b></span>
+                </div>
+                <div style={{
+                  borderTop: "1px solid #1a2438", marginTop: 4, paddingTop: 4,
+                  display: "flex", justifyContent: "space-between",
+                }}>
+                  <span>合計 K+V/token/layer</span>
+                  <b style={{color:"#eee"}}>{calc.kvPerTokenPerLayer} bytes</b>
+                </div>
+                <div style={{
+                  borderTop: "1px solid #1a2438", marginTop: 4, paddingTop: 4,
+                  display: "flex", justifyContent: "space-between",
+                }}>
+                  <span>× {M.num_layers}層 × {kvTokens.toLocaleString()}tok</span>
+                  <b style={{color:"#ff5555"}}>{fmtGB(calc.kvCacheTotal)} GB</b>
+                </div>
+              </div>
+            </Section>
+
+            <Section title="Precision & GPU" color="#bb55ff">
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, color: "#99aabb", marginBottom: 5 }}>MoE Expert Weights</div>
+                <div style={{ display: "flex", gap: 5 }}>
+                  {[
+                    { v: 0.5, label: "MXFP4 (native)" },
+                    { v: 1, label: "FP8" },
+                    { v: 2, label: "BF16 (upcast)" },
+                  ].map(({ v, label }) => (
+                    <Btn key={v} active={moePrec === v} onClick={() => setMoePrec(v)} color="#bb55ff">{label}</Btn>
+                  ))}
+                </div>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, color: "#99aabb", marginBottom: 5 }}>Attention Weights</div>
+                <div style={{ display: "flex", gap: 5 }}>
+                  {[{ v: 2, label: "BF16" }, { v: 1, label: "FP8" }].map(({ v, label }) => (
+                    <Btn key={v} active={attnPrec === v} onClick={() => setAttnPrec(v)} color="#bb55ff">{label}</Btn>
+                  ))}
+                </div>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, color: "#99aabb", marginBottom: 5 }}>KV Cache Precision</div>
+                <div style={{ display: "flex", gap: 5 }}>
+                  {[{ v: 2, label: "BF16" }, { v: 1, label: "FP8" }].map(({ v, label }) => (
+                    <Btn key={v} active={kvBytes === v} onClick={() => setKvBytes(v)} color="#bb55ff">{label}</Btn>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 11, color: "#99aabb", marginBottom: 5 }}>GPU HBM</div>
+                <div style={{ display: "flex", gap: 5 }}>
+                  {[[24,"24GB","4090/5090"],[48,"48GB","A6000/6000Ada"],[80,"80GB","A100/H100"],[141,"141GB","H200"],[192,"192GB","B200"]].map(([v,l,s])=>(
+                    <Btn key={v} active={gpuGB===v} onClick={()=>setGpuGB(v)} color="#4da6ff">
+                      <div style={{fontSize:11}}>{l}</div><div style={{fontSize:7,fontWeight:400,marginTop:1,opacity:0.7}}>{s}</div>
+                    </Btn>
+                  ))}
+                </div>
+              </div>
+            </Section>
+          </div>
+
+          {/* RIGHT: Results */}
+          <div>
+            <div style={{
+              background: util > 100
+                ? "linear-gradient(135deg, #2d1015, #1a0b0d)"
+                : "linear-gradient(135deg, #0d1a2d, #101e30)",
+              borderRadius: 10, padding: 16, marginBottom: 14,
+              border: `1px solid ${util > 100 ? "#5c1a1a" : "#1a2438"}`,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <span style={{ fontSize: 12, color: "#667788", fontWeight: 600 }}>1 GPU あたりの合計メモリ</span>
+                {util > 100 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#5c1a1a", color: "#ff5555", fontWeight: 700 }}>OOM</span>}
+              </div>
+              <div style={{
+                fontFamily: "monospace", fontSize: 34, fontWeight: 900, lineHeight: 1,
+                color: util > 100 ? "#ff5555" : util > 85 ? "#ddcc44" : "#44dd88",
+              }}>
+                {fmtGB(calc.totalMemory)} <span style={{ fontSize: 15, color: "#556677" }}>GB</span>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <div style={{ height: 7, background: "#0b1220", borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{
+                    height: "100%", width: `${Math.min(util, 100)}%`,
+                    background: util > 100 ? "#ff5555" : util > 85 ? "#ddcc44" : "#44dd88",
+                    borderRadius: 4, transition: "all 0.3s",
+                  }} />
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#556677", marginTop: 3 }}>
+                  <span>{util.toFixed(1)}% of {gpuGB} GB</span>
+                  <span>残り: {fmtGB(Math.max(0, gpuMemBytes - calc.totalMemory))} GB</span>
+                </div>
+              </div>
+              <div style={{
+                display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8,
+                marginTop: 10, background: "#0b1220", borderRadius: 6, padding: 8,
+              }}>
+                <Stat label="Weights" value={fmtGB(calc.totalWeights)+" GB"} color="#4da6ff" />
+                <Stat label="KV Cache" value={fmtGB(calc.kvCacheTotal)+" GB"} color="#ff5555" />
+                <Stat label="Activations" value={fmtGB(calc.activations)+" GB"} color="#44ffaa" />
+              </div>
+            </div>
+
+            <Section title="Weight Memory 内訳" color="#ffbb66">
+              <Bar label="Embedding" bytes={calc.embedding} total={calc.totalMemory} color={C.emb}
+                note={`BF16 ÷TP${tp}`} />
+              <Bar label="Attention (GQA)" bytes={calc.totalAttn} total={calc.totalMemory} color={C.attn}
+                note={`${M.num_layers}層 × q${M.num_attention_heads}h+kv${M.num_kv_heads}h ÷TP${tp}`} />
+              <Bar label="Routed Experts" bytes={calc.totalRoutedExp} total={calc.totalMemory} color={C.routed}
+                note={`${M.num_layers}層 × ${calc.expertsPerGpu}exp/GPU × ${moePrec === 0.5 ? "MXFP4" : moePrec === 1 ? "FP8" : "BF16"}`} />
+              <Bar label="Router Gate" bytes={calc.totalRouter} total={calc.totalMemory} color={C.router}
+                note="BF16 replicated" />
+              <Bar label="LM Head" bytes={calc.lmHead} total={calc.totalMemory} color={C.lm}
+                note={`BF16 ÷TP${tp}`} />
+              <Bar label="LayerNorm" bytes={calc.totalLayerNorm} total={calc.totalMemory} color={C.norm}
+                note="BF16 replicated" />
+              <div style={{
+                borderTop: "1px solid #1a2438", marginTop: 6, paddingTop: 6,
+                display: "flex", justifyContent: "space-between",
+                fontFamily: "monospace", fontSize: 12, fontWeight: 700,
+              }}>
+                <span style={{ color: "#99aabb" }}>Weights Total</span>
+                <span>{fmtGB(calc.totalWeights)} GB</span>
+              </div>
+            </Section>
+
+            <Section title="KV Cache + Runtime" color="#ff5555">
+              <Bar label="KV Cache (GQA)" bytes={calc.kvCacheTotal} total={calc.totalMemory} color={C.kv}
+                note={`${calc.kvHeadsPerGpu}kv_h × d${M.head_dim} × K+V × ${M.num_layers}L × ${kvTokens.toLocaleString()}tok`} />
+              <Bar label="Activations (est.)" bytes={calc.activations} total={calc.totalMemory} color={C.act}
+                note="runtime buffers" />
+            </Section>
+
+            {/* Info box: mixed precision note */}
+            <div style={{
+              background: "#0e1525", borderRadius: 8, padding: 10, marginBottom: 14,
+              border: "1px solid #1a2438", fontSize: 10, color: "#667788",
+              lineHeight: 1.7, fontFamily: "monospace",
+            }}>
+              <span style={{ color: "#ddaa44", fontWeight: 700 }}>Mixed Precision Note</span><br/>
+              gpt-oss-120bはネイティブでMXFP4量子化。MoE Expert重みのみMXFP4 (0.5B/param)、<br/>
+              Attention, Router, Embedding, LM HeadはBF16 (2B/param) で格納。<br/>
+              quantization_config.modules_to_not_convert: self_attn, mlp.router, embed_tokens, lm_head
+            </div>
+
+            <div style={{
+              background: "#0b1220", borderRadius: 8, padding: 10,
+              fontSize: 10, color: "#3d4d5d", lineHeight: 1.7, fontFamily: "monospace",
+            }}>
+              <span style={{ color: "#556677", fontWeight: 700 }}>Architecture</span><br/>
+              layers:{M.num_layers} (sliding:{M.num_sliding_layers} full:{M.num_full_layers}) hidden:{M.hidden_size}<br/>
+              GQA: {M.num_attention_heads}q_heads / {M.num_kv_heads}kv_heads (group={M.num_attention_heads/M.num_kv_heads}) head_dim={M.head_dim} bias={String(M.attention_bias)}<br/>
+              sliding_window:{M.sliding_window} tokens (alternating pattern)<br/>
+              MoE: {M.num_local_experts} experts × top-{M.num_experts_per_tok} SwiGLU dim={M.intermediate_size}<br/>
+              vocab:{M.vocab_size.toLocaleString()} max_pos:{M.max_position_embeddings.toLocaleString()} RoPE(YaRN, θ=150k)
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
